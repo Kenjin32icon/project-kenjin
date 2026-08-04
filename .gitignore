@@ -1,2 +1,4 @@
 .env
 orchestrator/.venv
+compile_system.py
+project-kenjin_compiled_system.txt
