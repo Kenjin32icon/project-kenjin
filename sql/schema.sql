@@ -1,0 +1,102 @@
+-- WARNING: This schema is for context only and is not meant to be run.
+-- Table order and constraints may not be valid for execution.
+
+CREATE TABLE public.strategy_db (
+  asset text NOT NULL UNIQUE,
+  opt_threshold numeric,
+  opt_sl_mult numeric,
+  opt_tp_mult numeric,
+  scheduled_start_hour integer,
+  scheduled_end_hour integer,
+  live_approved boolean NOT NULL DEFAULT false,
+  updated_at timestamp with time zone DEFAULT now(),
+  win_rate numeric,
+  profit_factor numeric,
+  sample_size integer,
+  CONSTRAINT strategy_db_pkey PRIMARY KEY (asset)
+);
+CREATE TABLE public.trade_telemetry (
+  id bigint NOT NULL DEFAULT nextval('trade_telemetry_id_seq'::regclass),
+  asset text NOT NULL,
+  type text NOT NULL,
+  price numeric,
+  lots numeric,
+  profit numeric,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  rsi numeric,
+  entry_score numeric,
+  sl_price numeric,
+  tp_price numeric,
+  magic_number bigint,
+  account_type text,
+  session_hour integer,
+  forecast_id bigint,
+  CONSTRAINT trade_telemetry_pkey PRIMARY KEY (id),
+  CONSTRAINT trade_telemetry_forecast_id_fkey FOREIGN KEY (forecast_id) REFERENCES public.forecasts(id),
+  CONSTRAINT fk_trade_telemetry_forecast FOREIGN KEY (forecast_id) REFERENCES public.forecasts(id)
+);
+CREATE TABLE public.trading_assets (
+  asset_id uuid NOT NULL DEFAULT gen_random_uuid(),
+  symbol character varying NOT NULL UNIQUE,
+  asset_class character varying NOT NULL,
+  pip_size numeric NOT NULL,
+  tick_size numeric NOT NULL,
+  contract_size integer NOT NULL DEFAULT 100000,
+  is_active boolean DEFAULT true,
+  created_at timestamp with time zone DEFAULT now(),
+  updated_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT trading_assets_pkey PRIMARY KEY (asset_id)
+);
+CREATE TABLE public.forecasts (
+  id bigint NOT NULL DEFAULT nextval('forecasts_id_seq'::regclass),
+  asset character varying NOT NULL,
+  generated_at timestamp with time zone NOT NULL DEFAULT now(),
+  horizon_minutes integer NOT NULL DEFAULT 30,
+  bullish_prob numeric CHECK (bullish_prob >= 0::numeric AND bullish_prob <= 1::numeric),
+  bearish_prob numeric CHECK (bearish_prob >= 0::numeric AND bearish_prob <= 1::numeric),
+  suggested_sl_atr_mult numeric,
+  suggested_tp_atr_mult numeric,
+  rationale text,
+  model_used character varying,
+  CONSTRAINT forecasts_pkey PRIMARY KEY (id)
+);
+CREATE TABLE public.tick_telemetry (
+  id bigint NOT NULL DEFAULT nextval('tick_telemetry_id_seq'::regclass),
+  asset character varying NOT NULL,
+  ts timestamp with time zone NOT NULL DEFAULT now(),
+  bid numeric,
+  ask numeric,
+  tick_volume integer,
+  rsi numeric CHECK (rsi >= 0::numeric AND rsi <= 100::numeric),
+  tema numeric,
+  ac numeric,
+  sar numeric,
+  adx numeric CHECK (adx >= 0::numeric AND adx <= 100::numeric),
+  ma10 numeric,
+  ma20 numeric,
+  ma50 numeric,
+  ma100 numeric,
+  ma200 numeric,
+  CONSTRAINT tick_telemetry_pkey PRIMARY KEY (id)
+);
+CREATE TABLE public.optimization_logs (
+  id integer NOT NULL DEFAULT nextval('optimization_logs_id_seq'::regclass),
+  asset character varying NOT NULL,
+  timeframe character varying NOT NULL,
+  pass_number integer,
+  profit numeric,
+  total_trades integer,
+  win_rate numeric,
+  drawdown numeric,
+  parameters jsonb,
+  tested_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT optimization_logs_pkey PRIMARY KEY (id)
+);
+CREATE TABLE public.missed_trade_analytics (
+  id integer NOT NULL DEFAULT nextval('missed_trade_analytics_id_seq'::regclass),
+  asset character varying NOT NULL,
+  groq_analysis text,
+  suggested_logic_tweak text,
+  analyzed_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT missed_trade_analytics_pkey PRIMARY KEY (id)
+);
