@@ -1,0 +1,217 @@
+{
+	"info": {
+		"_postman_id": "a8f12c3d-kenjin-v10-qa-testsuite",
+		"name": "PROJECT KENJIN - QA Orchestrator Test Suite",
+		"description": "Validation testing for FastAPI Orchestrator, MQL5 EA integration, and database features.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://127.0.0.1:8000",
+			"type": "string"
+		},
+		{
+			"key": "apiKey",
+			"value": "your_secret_api_key_here",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "1. Health Check (Unauthenticated)",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{baseUrl}}/health",
+					"host": ["{{baseUrl}}"],
+					"path": ["health"]
+				}
+			},
+			"response": [],
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"pm.test('Status code is 200', function () {",
+							"    pm.response.to.have.status(200);",
+							"});",
+							"pm.test('Database connection is ok', function () {",
+							"    var jsonData = pm.response.json();",
+							"    pm.expect(jsonData.status).to.eql('ok');",
+							"    pm.expect(jsonData.db).to.eql('ok');",
+							"});"
+						],
+						"type": "text/javascript"
+					}
+				}
+			]
+		},
+		{
+			"name": "2. Get Strategy Params (Valid Auth)",
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "X-API-Key",
+						"value": "{{apiKey}}",
+						"type": "text"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/strategy_params?asset=EURUSD",
+					"host": ["{{baseUrl}}"],
+					"path": ["strategy_params"],
+					"query": [
+						{
+							"key": "asset",
+							"value": "EURUSD"
+						}
+					]
+				}
+			},
+			"response": [],
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"pm.test('Status code is 200', function () {",
+							"    pm.response.to.have.status(200);",
+							"});",
+							"pm.test('Returns strategy parameters schema', function () {",
+							"    var jsonData = pm.response.json();",
+							"    pm.expect(jsonData).to.have.property('opt_threshold');",
+							"    pm.expect(jsonData).to.have.property('opt_sl_mult');",
+							"    pm.expect(jsonData).to.have.property('live_approved');",
+							"});"
+						],
+						"type": "text/javascript"
+					}
+				}
+			]
+		},
+		{
+			"name": "3. Post Tick Feature Snapshot",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "X-API-Key",
+						"value": "{{apiKey}}",
+						"type": "text"
+					},
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"asset\": \"EURUSD\",\n  \"bid\": 1.08500,\n  \"ask\": 1.08515,\n  \"tick_volume\": 142,\n  \"rsi\": 54.20,\n  \"tema\": 1.08490,\n  \"ac\": 0.00012,\n  \"sar\": 1.08410,\n  \"adx\": 22.50,\n  \"ma10\": 1.08480,\n  \"ma20\": 1.08470,\n  \"ma50\": 1.08430,\n  \"ma100\": 1.08390,\n  \"ma200\": 1.08200\n}"
+				},
+				"url": {
+					"raw": "{{baseUrl}}/ticks",
+					"host": ["{{baseUrl}}"],
+					"path": ["ticks"]
+				}
+			},
+			"response": [],
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"pm.test('Status code is 201 Created', function () {",
+							"    pm.response.to.have.status(201);",
+							"});"
+						],
+						"type": "text/javascript"
+					}
+				}
+			]
+		},
+		{
+			"name": "4. Post Trade Execution Telemetry",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "X-API-Key",
+						"value": "{{apiKey}}",
+						"type": "text"
+					},
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"asset\": \"EURUSD\",\n  \"type\": \"BUY_CLOSE\",\n  \"price\": 1.08750,\n  \"lots\": 0.10,\n  \"profit\": 25.00,\n  \"rsi\": 62.10,\n  \"entry_score\": 0.72,\n  \"sl_price\": 1.08350,\n  \"tp_price\": 1.08950,\n  \"magic_number\": 1955224281,\n  \"account_type\": \"demo\",\n  \"session_hour\": 14,\n  \"forecast_id\": null\n}"
+				},
+				"url": {
+					"raw": "{{baseUrl}}/telemetry",
+					"host": ["{{baseUrl}}"],
+					"path": ["telemetry"]
+				}
+			},
+			"response": [],
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"pm.test('Status code is 201 Created', function () {",
+							"    pm.response.to.have.status(201);",
+							"});"
+						],
+						"type": "text/javascript"
+					}
+				}
+			]
+		},
+		{
+			"name": "5. Invalid API Key Auth Check (Negative Test)",
+			"request": {
+				"method": "GET",
+				"header": [
+					{
+						"key": "X-API-Key",
+						"value": "INVALID_KEY",
+						"type": "text"
+					}
+				],
+				"url": {
+					"raw": "{{baseUrl}}/strategy_params?asset=EURUSD",
+					"host": ["{{baseUrl}}"],
+					"path": ["strategy_params"],
+					"query": [
+						{
+							"key": "asset",
+							"value": "EURUSD"
+						}
+					]
+				}
+			},
+			"response": [],
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"pm.test('Status code is 401 Unauthorized', function () {",
+							"    pm.response.to.have.status(401);",
+							"});"
+						],
+						"type": "text/javascript"
+					}
+				}
+			]
+		}
+	]
+}
