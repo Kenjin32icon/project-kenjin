@@ -19,6 +19,7 @@ from groq import AsyncGroq
 
 # Load environment variables
 load_dotenv()
+database_url = os.getenv("DATABASE_URL")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("orchestrator")
 
