@@ -3,3 +3,5 @@ orchestrator/.venv
 compile_system.py
 project-kenjin_compiled_system.txt
 orchestrator/__pycache__/main.cpython-311.pyc
+orchestrator/__pycache__/main.cpython-312.pyc
+
