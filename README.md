@@ -26,11 +26,12 @@ Open your terminal and run the following commands to pull the code and initialis
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/yourusername/project-kenjin.git
+git clone https://github.com/Kenjin32icon/project-kenjin.git
 cd project-kenjin
 
 # 2. Create and activate a virtual environment
 python -m venv venv
+source orchestrator/.venv/bin/activate
 source venv/bin/activate  # On Windows use: venv\Scripts\activate
 
 # 3. Install the required dependencies
