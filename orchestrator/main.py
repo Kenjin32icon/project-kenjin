@@ -3,8 +3,14 @@ Entry point. Run with:
     uvicorn orchestrator.main:app --host 127.0.0.1 --port 8000 --reload
 
 (drop --reload for the systemd/Render deployment - it's a dev-only convenience)
+
+NOTE: This is a hybrid file. It contains the inline schema, DB, and routing logic 
+from the monolithic implementation, enhanced with the critical bug fixes 
+(Groq model validation, env-configured job intervals, and safe removal of auto_tester) 
+from the modular update.
 """
 import os
+import re
 import json
 import logging
 import pandas as pd
@@ -19,12 +25,28 @@ from groq import AsyncGroq
 
 # Load environment variables
 load_dotenv()
-database_url = os.getenv("DATABASE_URL")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("orchestrator")
 
 # ==========================================
-# 1. AUTHENTICATION & DATABASE
+# 1. VALIDATION & UTILITIES
+# ==========================================
+# Groq's model catalog uses lowercase, hyphenated, slash-namespaced IDs.
+_VALID_MODEL_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*(/[a-z0-9]+(-[a-z0-9]+)*)*$")
+
+def resolve_and_validate_groq_model() -> str:
+    model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
+    if not _VALID_MODEL_PATTERN.match(model):
+        raise RuntimeError(
+            f"GROQ_MODEL='{model}' doesn't look like a valid Groq model id "
+            f"(expected lowercase/hyphenated, e.g. 'openai/gpt-oss-20b'). "
+            f"Check .env - this is the exact bug that caused the repeated "
+            f"'model_not_found' 404s in your forecast job logs."
+        )
+    return model
+
+# ==========================================
+# 2. AUTHENTICATION & DATABASE
 # ==========================================
 def verify_api_key(x_api_key: str = Header(default="")) -> None:
     expected = os.environ.get("ORCH_API_KEY", "")
@@ -53,7 +75,7 @@ def get_pool() -> asyncpg.Pool:
     return _pool
 
 # ==========================================
-# 2. PYDANTIC SCHEMAS
+# 3. PYDANTIC SCHEMAS
 # ==========================================
 class TickIn(BaseModel):
     asset: str
@@ -103,10 +125,8 @@ class HealthOut(BaseModel):
     db: str
 
 # ==========================================
-# 3. BACKGROUND JOBS
+# 4. BACKGROUND JOBS
 # ==========================================
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "GPT OSS 20B")
-
 async def get_distinct_assets() -> list[str]:
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -128,8 +148,10 @@ async def pull_feature_window(asset: str, minutes: int = 30) -> pd.DataFrame:
     return pd.DataFrame([dict(r) for r in rows])
 
 async def run_forecast_cycle() -> None:
+    groq_model = resolve_and_validate_groq_model()
     client = AsyncGroq(api_key=os.environ.get("GROQ_API_KEY"))
     assets = await get_distinct_assets()
+    
     for asset in assets:
         try:
             df = await pull_feature_window(asset, minutes=30)
@@ -143,7 +165,7 @@ async def run_forecast_cycle() -> None:
             })
             
             completion = await client.chat.completions.create(
-                model=GROQ_MODEL,
+                model=groq_model,
                 messages=[
                     {"role": "system", "content": "Return ONLY JSON: {\"bullish_prob\": 50, \"bearish_prob\": 50, \"suggested_sl_atr_mult\": 1.5, \"suggested_tp_atr_mult\": 3.0, \"rationale\": \"string\"}"},
                     {"role": "user", "content": summary},
@@ -159,7 +181,7 @@ async def run_forecast_cycle() -> None:
                     INSERT INTO forecasts (asset, horizon_minutes, bullish_prob, bearish_prob, suggested_sl_atr_mult, suggested_tp_atr_mult, rationale, model_used)
                     VALUES ($1, 30, $2, $3, $4, $5, $6, $7)
                     """,
-                    asset, data["bullish_prob"], data["bearish_prob"], data["suggested_sl_atr_mult"], data["suggested_tp_atr_mult"], data.get("rationale", ""), GROQ_MODEL,
+                    asset, data["bullish_prob"], data["bearish_prob"], data["suggested_sl_atr_mult"], data["suggested_tp_atr_mult"], data.get("rationale", ""), groq_model,
                 )
                 await conn.execute(
                     "UPDATE strategy_db SET opt_sl_mult = $2, opt_tp_mult = $3, updated_at = now() WHERE asset = $1",
@@ -192,21 +214,45 @@ async def run_gatekeeper_cycle() -> None:
             )
 
 # ==========================================
-# 4. FASTAPI APP & ROUTES
+# 5. FASTAPI APP & ROUTES
 # ==========================================
 scheduler = AsyncIOScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Fail fast, before accepting any traffic, rather than 30 minutes into
+    # running with a broken forecast loop.
+    validated_model = resolve_and_validate_groq_model()
+    log.info("Using Groq model: %s", validated_model)
+
     await init_db_pool()
-    scheduler.add_job(run_forecast_cycle, "interval", minutes=30, id="groq_forecast", max_instances=1, coalesce=True)
-    scheduler.add_job(run_gatekeeper_cycle, "interval", hours=4, id="gatekeeper", max_instances=1, coalesce=True)
+    log.info("DB pool initialised.")
+    
+    scheduler.add_job(
+        run_forecast_cycle, "interval", 
+        minutes=int(os.environ.get("FORECAST_INTERVAL_MIN", 30)), 
+        id="groq_forecast", max_instances=1, coalesce=True
+    )
+    scheduler.add_job(
+        run_gatekeeper_cycle, "interval", 
+        hours=int(os.environ.get("GATEKEEPER_INTERVAL_HOURS", 4)), 
+        id="gatekeeper", max_instances=1, coalesce=True
+    )
+
+    # auto_tester (headless Wine/MT5 Strategy Tester automation) is
+    # DELIBERATELY NOT scheduled here. As written it risks shutting down 
+    # active MT5 terminal instances and relies on hardcoded mock parsers.
+    
     scheduler.start()
+    log.info("Scheduler started: forecast every %sm, gatekeeper every %sh",
+              os.environ.get("FORECAST_INTERVAL_MIN", 30), os.environ.get("GATEKEEPER_INTERVAL_HOURS", 4))
     yield
+    
     scheduler.shutdown(wait=False)
     await close_db_pool()
+    log.info("DB pool closed.")
 
-app = FastAPI(title="Project KENJIN Orchestrator", version="10.0.0", lifespan=lifespan)
+app = FastAPI(title="Project KENJIN Orchestrator", version="10.0.1", lifespan=lifespan)
 
 @app.get("/health", response_model=HealthOut)
 async def health():
