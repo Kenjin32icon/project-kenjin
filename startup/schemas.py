@@ -1,5 +1,6 @@
 """
-Pydantic models. These are the API contract between v10 (MQL5) and this
+Pydantic API contract schema for v10 orchestrator integration.
+These are the API contract between v10 (MQL5) and this
 service - field names here must match exactly what v10's PostTick(),
 PostTelemetry(), and FetchStrategyParams() send/expect.
 """
@@ -26,7 +27,7 @@ class TickIn(BaseModel):
 
 class TelemetryIn(BaseModel):
     asset: str
-    type: str  # BUY_CLOSE / SELL_CLOSE
+    type: str  # BUY_CLOSE / SELL_CLOSE / BUY_OPEN / SELL_OPEN
     price: float
     lots: float
     profit: float
@@ -52,6 +53,9 @@ class StrategyParamsOut(BaseModel):
     forecast_id: Optional[int] = None
     bullish_prob: Optional[float] = None
     bearish_prob: Optional[float] = None
+    tier2_action: str = "HOLD"  # BUY, SELL, or HOLD
+    tier2_confidence: float = 0.0
+    recommended_lot_multiplier: float = 1.0
 
 
 class HealthOut(BaseModel):
