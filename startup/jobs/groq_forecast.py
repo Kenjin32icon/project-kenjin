@@ -1,13 +1,6 @@
 """
-Builds a compact feature summary from the recent tick window and asks Groq
-for a 30-minute directional probability + dynamic SL/TP multiplier
-suggestion. Writes the result to `forecasts` and mirrors the SL/TP
-multipliers into `strategy_db` so v10 picks them up on its next
-/strategy_params poll.
-
-Runs on its own APScheduler cadence (see orchestrator/main.py) - separate
-from feature_pull's faster cadence, so a slow/rate-limited Groq call never
-blocks tick ingestion.
+Tier 1 Macro Engine: Calls Groq API for 15-minute structural direction logic,
+incorporating advanced volatility regimes, volume anomalies, and price velocity.
 """
 import os
 import json
@@ -18,52 +11,52 @@ from startup.db import get_pool
 from startup.jobs.feature_pull import get_distinct_assets, pull_feature_window
 
 log = logging.getLogger("groq_forecast")
-
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
 
-SYSTEM_PROMPT = """You are a quantitative FX/CFD analyst. You will be given a
-30-minute window of recent price, volume, and indicator data for one asset.
-Respond with ONLY a JSON object, no prose, no markdown fences, matching this
-exact shape:
-{"bullish_prob": <0.0-1.0 float>, "bearish_prob": <0.0-1.0 float>,
- "suggested_sl_atr_mult": <float>, "suggested_tp_atr_mult": <float>,
- "rationale": "<one short sentence>"}
-bullish_prob and bearish_prob must sum to 1.0. Base suggested_sl_atr_mult and
-suggested_tp_atr_mult on the volatility and momentum you observe - widen SL
-on high-ATR/choppy windows, don't just repeat generic 1.5/3.0 defaults."""
+SYSTEM_PROMPT = """
+You are a quantitative macro forecasting AI. Analyze the provided technical indicators 
+and output directional probabilities strictly for the next 15-minute window.
+Output strictly in JSON format using keys 'bullish_prob' and 'bearish_prob' (as float values between 0.0 and 100.0, summing to 100.0), and optional 'rationale'.
+Alternatively, you may output 'direction' (BULLISH, BEARISH, NEUTRAL) and 'confidence' (0.0 to 1.0).
+"""
 
 
 def summarise_frame(df: pd.DataFrame) -> str:
-    if df.empty:
-        return "No recent tick data available for this asset."
+    """Summarises the advanced feature window for Groq inference."""
+    if df.empty or len(df) < 5:
+        return json.dumps({"error": "Insufficient tick data."})
+
     latest = df.iloc[-1]
     summary = {
         "n_ticks": len(df),
         "latest_bid": float(latest.get("bid") or 0),
         "latest_ask": float(latest.get("ask") or 0),
-        "latest_rsi": float(latest.get("rsi") or 0),
-        "latest_adx": float(latest.get("adx") or 0),
-        "tema_trend": "rising" if df["tema"].iloc[-1] > df["tema"].iloc[0] else "falling",
-        "ma_stack": {
-            "ma10": float(latest.get("ma10") or 0), "ma20": float(latest.get("ma20") or 0),
-            "ma50": float(latest.get("ma50") or 0), "ma100": float(latest.get("ma100") or 0),
-            "ma200": float(latest.get("ma200") or 0),
-        },
-        "avg_tick_volume": float(df["tick_volume"].mean()) if "tick_volume" in df else None,
+        "rsi": float(latest.get("rsi") or 50.0),
+        "adx": float(latest.get("adx") or 0),
+        "volatility_regime": float(latest.get("volatility_regime") or 0),
+        "rvol": float(latest.get("rvol") or 1.0),
+        "ma_spread_delta": float(latest.get("ma_spread_delta") or 0.0),
+        "price_velocity_1m": float(latest.get("price_velocity_1m") or 0.0),
+        "price_velocity_5m": float(latest.get("price_velocity_5m") or 0.0),
     }
     return json.dumps(summary)
 
 
 async def run_forecast_cycle() -> None:
-    """Called on the APScheduler ~30-min cadence for every asset with recent ticks."""
-    client = AsyncGroq(api_key=os.environ["GROQ_API_KEY"])
+    """Called on APScheduler cadence to evaluate and update 15-minute market forecasts."""
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        log.error("GROQ_API_KEY environment variable missing.")
+        return
+
+    client = AsyncGroq(api_key=api_key)
     assets = await get_distinct_assets()
 
     for asset in assets:
         try:
-            df = await pull_feature_window(asset, minutes=30)
-            if df.empty:
-                log.info("Skipping forecast for %s - no recent ticks.", asset)
+            # Pull 20 minutes of context for a 15-minute prediction window
+            df = await pull_feature_window(asset, minutes=20)
+            if df.empty or len(df) < 5:
                 continue
 
             completion = await client.chat.completions.create(
@@ -75,33 +68,43 @@ async def run_forecast_cycle() -> None:
                 temperature=0.2,
             )
             raw = completion.choices[0].message.content.strip()
-            data = json.loads(raw)  # let this raise loudly - a malformed Groq response should not write bad data
+
+            # Clean markdown code fences if output by LLM
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+
+            data = json.loads(raw)
+            
+            # Map probabilities cleanly; fallback to direction mapping if legacy output format is received
+            if "bullish_prob" in data and "bearish_prob" in data:
+                bullish_prob = float(data["bullish_prob"])
+                bearish_prob = float(data["bearish_prob"])
+            else:
+                direction = data.get("direction", "NEUTRAL").upper()
+                confidence = float(data.get("confidence", 0.5))
+                if direction == "BULLISH":
+                    bullish_prob = round(confidence * 100.0, 2)
+                    bearish_prob = round((1.0 - confidence) * 100.0, 2)
+                elif direction == "BEARISH":
+                    bearish_prob = round(confidence * 100.0, 2)
+                    bullish_prob = round((1.0 - confidence) * 100.0, 2)
+                else:
+                    bullish_prob = 50.0
+                    bearish_prob = 50.0
+
+            rationale = data.get("rationale", "")
 
             pool = get_pool()
             async with pool.acquire() as conn:
-                forecast_id = await conn.fetchval(
-                    """
-                    INSERT INTO forecasts
-                        (asset, horizon_minutes, bullish_prob, bearish_prob,
-                         suggested_sl_atr_mult, suggested_tp_atr_mult, rationale, model_used)
-                    VALUES ($1, 30, $2, $3, $4, $5, $6, $7)
-                    RETURNING id
-                    """,
-                    asset, data["bullish_prob"], data["bearish_prob"],
-                    data["suggested_sl_atr_mult"], data["suggested_tp_atr_mult"],
-                    data.get("rationale", ""), GROQ_MODEL,
-                )
-                await conn.execute(
-                    """
-                    UPDATE strategy_db
-                    SET opt_sl_mult = $2, opt_tp_mult = $3, updated_at = now()
-                    WHERE asset = $1
-                    """,
-                    asset, data["suggested_sl_atr_mult"], data["suggested_tp_atr_mult"],
-                )
-            log.info("Forecast #%s written for %s: bullish=%.1f%%", forecast_id, asset, data["bullish_prob"])
-
-        except Exception:
-            # One asset's failure (bad Groq JSON, rate limit, etc.) must not
-            # take down the whole cycle for every other asset.
-            log.exception("Forecast cycle failed for asset %s", asset)
+                query = """
+                    INSERT INTO forecasts (asset, horizon_minutes, bullish_prob, bearish_prob, rationale, model_used)
+                    VALUES ($1, 15, $2, $3, $4, $5)
+                """
+                await conn.execute(query, asset, bullish_prob, bearish_prob, rationale, GROQ_MODEL)
+                
+            log.info(f"Forecast updated for {asset}: Bullish={bullish_prob}%, Bearish={bearish_prob}%")
+        except Exception as e:
+            log.exception(f"Forecast cycle error for asset {asset}: {e}")
