@@ -1,102 +1,116 @@
--- WARNING: This schema is for context only and is not meant to be run.
--- Table order and constraints may not be valid for execution.
+-- Project KENJIN v10 Consolidated Database Schema (Combined, Refined & Indexed)[cite: 15]
 
-CREATE TABLE public.strategy_db (
-  asset text NOT NULL UNIQUE,
-  opt_threshold numeric,
-  opt_sl_mult numeric,
-  opt_tp_mult numeric,
-  scheduled_start_hour integer,
-  scheduled_end_hour integer,
-  live_approved boolean NOT NULL DEFAULT false,
-  updated_at timestamp with time zone DEFAULT now(),
-  win_rate numeric,
-  profit_factor numeric,
-  sample_size integer,
-  CONSTRAINT strategy_db_pkey PRIMARY KEY (asset)
+-- 1. Trading Assets Catalog
+CREATE TABLE IF NOT EXISTS trading_assets (
+    asset_id UUID NOT NULL DEFAULT gen_random_uuid(),
+    symbol VARCHAR(32) NOT NULL UNIQUE,
+    asset_class VARCHAR(64) NOT NULL,
+    pip_size NUMERIC(12, 5) NOT NULL,
+    tick_size NUMERIC(12, 5) NOT NULL,
+    contract_size INT NOT NULL DEFAULT 100000,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT trading_assets_pkey PRIMARY KEY (asset_id)
 );
-CREATE TABLE public.trade_telemetry (
-  id bigint NOT NULL DEFAULT nextval('trade_telemetry_id_seq'::regclass),
-  asset text NOT NULL,
-  type text NOT NULL,
-  price numeric,
-  lots numeric,
-  profit numeric,
-  created_at timestamp with time zone NOT NULL DEFAULT now(),
-  rsi numeric,
-  entry_score numeric,
-  sl_price numeric,
-  tp_price numeric,
-  magic_number bigint,
-  account_type text,
-  session_hour integer,
-  forecast_id bigint,
-  CONSTRAINT trade_telemetry_pkey PRIMARY KEY (id),
-  CONSTRAINT trade_telemetry_forecast_id_fkey FOREIGN KEY (forecast_id) REFERENCES public.forecasts(id),
-  CONSTRAINT fk_trade_telemetry_forecast FOREIGN KEY (forecast_id) REFERENCES public.forecasts(id)
+
+-- 2. Strategy Parameters & Performance Database
+CREATE TABLE IF NOT EXISTS strategy_db (
+    asset VARCHAR(32) PRIMARY KEY,
+    opt_threshold NUMERIC(4,2) DEFAULT 0.60,
+    opt_sl_mult NUMERIC(4,2) DEFAULT 1.50,
+    opt_tp_mult NUMERIC(4,2) DEFAULT 3.00,
+    scheduled_start_hour INT,
+    scheduled_end_hour INT,
+    live_approved BOOLEAN DEFAULT FALSE,
+    win_rate NUMERIC(5,2) DEFAULT 0.00,
+    profit_factor NUMERIC(5,2) DEFAULT 0.00,
+    sample_size INT DEFAULT 0,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE TABLE public.trading_assets (
-  asset_id uuid NOT NULL DEFAULT gen_random_uuid(),
-  symbol character varying NOT NULL UNIQUE,
-  asset_class character varying NOT NULL,
-  pip_size numeric NOT NULL,
-  tick_size numeric NOT NULL,
-  contract_size integer NOT NULL DEFAULT 100000,
-  is_active boolean DEFAULT true,
-  created_at timestamp with time zone DEFAULT now(),
-  updated_at timestamp with time zone DEFAULT now(),
-  CONSTRAINT trading_assets_pkey PRIMARY KEY (asset_id)
+
+-- 3. AI Forecasts Table
+CREATE TABLE IF NOT EXISTS forecasts (
+    id BIGSERIAL PRIMARY KEY,
+    asset VARCHAR(32) NOT NULL,
+    horizon_minutes INT DEFAULT 15,
+    bullish_prob NUMERIC(5,2) NOT NULL CHECK (bullish_prob >= 0 AND bullish_prob <= 100),
+    bearish_prob NUMERIC(5,2) NOT NULL CHECK (bearish_prob >= 0 AND bearish_prob <= 100),
+    suggested_sl_atr_mult NUMERIC(4,2),
+    suggested_tp_atr_mult NUMERIC(4,2),
+    rationale TEXT,
+    model_used VARCHAR(64),
+    generated_at TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE TABLE public.forecasts (
-  id bigint NOT NULL DEFAULT nextval('forecasts_id_seq'::regclass),
-  asset character varying NOT NULL,
-  generated_at timestamp with time zone NOT NULL DEFAULT now(),
-  horizon_minutes integer NOT NULL DEFAULT 30,
-  bullish_prob numeric CHECK (bullish_prob >= 0::numeric AND bullish_prob <= 1::numeric),
-  bearish_prob numeric CHECK (bearish_prob >= 0::numeric AND bearish_prob <= 1::numeric),
-  suggested_sl_atr_mult numeric,
-  suggested_tp_atr_mult numeric,
-  rationale text,
-  model_used character varying,
-  CONSTRAINT forecasts_pkey PRIMARY KEY (id)
+
+-- Optimize fast lookup of latest asset forecast[cite: 15]
+CREATE INDEX IF NOT EXISTS idx_forecasts_asset_generated ON forecasts(asset, generated_at DESC);
+
+-- 4. Tick & Indicator Telemetry Feed
+CREATE TABLE IF NOT EXISTS tick_telemetry (
+    id BIGSERIAL PRIMARY KEY,
+    asset VARCHAR(32) NOT NULL,
+    bid NUMERIC(12, 5) NOT NULL,
+    ask NUMERIC(12, 5) NOT NULL,
+    tick_volume NUMERIC(12, 2),
+    rsi NUMERIC(6, 2) CHECK (rsi >= 0 AND rsi <= 100),
+    tema NUMERIC(12, 5),
+    ac NUMERIC(12, 5),
+    sar NUMERIC(12, 5),
+    adx NUMERIC(6, 2) CHECK (adx >= 0 AND adx <= 100),
+    ma10 NUMERIC(12, 5),
+    ma20 NUMERIC(12, 5),
+    ma50 NUMERIC(12, 5),
+    ma100 NUMERIC(12, 5),
+    ma200 NUMERIC(12, 5),
+    ts TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE TABLE public.tick_telemetry (
-  id bigint NOT NULL DEFAULT nextval('tick_telemetry_id_seq'::regclass),
-  asset character varying NOT NULL,
-  ts timestamp with time zone NOT NULL DEFAULT now(),
-  bid numeric,
-  ask numeric,
-  tick_volume integer,
-  rsi numeric CHECK (rsi >= 0::numeric AND rsi <= 100::numeric),
-  tema numeric,
-  ac numeric,
-  sar numeric,
-  adx numeric CHECK (adx >= 0::numeric AND adx <= 100::numeric),
-  ma10 numeric,
-  ma20 numeric,
-  ma50 numeric,
-  ma100 numeric,
-  ma200 numeric,
-  CONSTRAINT tick_telemetry_pkey PRIMARY KEY (id)
+
+CREATE INDEX IF NOT EXISTS idx_tick_telemetry_asset_ts ON tick_telemetry(asset, ts DESC);
+
+-- 5. Trade Execution Telemetry
+CREATE TABLE IF NOT EXISTS trade_telemetry (
+    id BIGSERIAL PRIMARY KEY,
+    asset VARCHAR(32) NOT NULL,
+    type VARCHAR(16) NOT NULL,
+    price NUMERIC(12, 5) NOT NULL,
+    lots NUMERIC(6, 2) NOT NULL,
+    profit NUMERIC(12, 2) NOT NULL,
+    rsi NUMERIC(6, 2),
+    entry_score NUMERIC(4, 2),
+    sl_price NUMERIC(12, 5),
+    tp_price NUMERIC(12, 5),
+    magic_number BIGINT,
+    account_type VARCHAR(16),
+    session_hour INT,
+    forecast_id BIGINT REFERENCES forecasts(id),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    ts TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE TABLE public.optimization_logs (
-  id integer NOT NULL DEFAULT nextval('optimization_logs_id_seq'::regclass),
-  asset character varying NOT NULL,
-  timeframe character varying NOT NULL,
-  pass_number integer,
-  profit numeric,
-  total_trades integer,
-  win_rate numeric,
-  drawdown numeric,
-  parameters jsonb,
-  tested_at timestamp with time zone DEFAULT now(),
-  CONSTRAINT optimization_logs_pkey PRIMARY KEY (id)
+
+-- Optimize Gatekeeper rolling performance evaluations[cite: 15]
+CREATE INDEX IF NOT EXISTS idx_trade_telemetry_asset_created ON trade_telemetry(asset, created_at DESC);
+
+-- 6. Optimization Logs (Auto-Tester)
+CREATE TABLE IF NOT EXISTS optimization_logs (
+    id BIGSERIAL PRIMARY KEY,
+    asset VARCHAR(32) NOT NULL,
+    timeframe VARCHAR(16) NOT NULL,
+    pass_number INT,
+    profit NUMERIC(12, 2),
+    total_trades INT,
+    win_rate NUMERIC(5, 2),
+    drawdown NUMERIC(5, 2),
+    parameters JSONB,
+    tested_at TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE TABLE public.missed_trade_analytics (
-  id integer NOT NULL DEFAULT nextval('missed_trade_analytics_id_seq'::regclass),
-  asset character varying NOT NULL,
-  groq_analysis text,
-  suggested_logic_tweak text,
-  analyzed_at timestamp with time zone DEFAULT now(),
-  CONSTRAINT missed_trade_analytics_pkey PRIMARY KEY (id)
+
+-- 7. Missed Trade Analytics
+CREATE TABLE IF NOT EXISTS missed_trade_analytics (
+    id BIGSERIAL PRIMARY KEY,
+    asset VARCHAR(32) NOT NULL,
+    groq_analysis TEXT,
+    suggested_logic_tweak TEXT,
+    analyzed_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
