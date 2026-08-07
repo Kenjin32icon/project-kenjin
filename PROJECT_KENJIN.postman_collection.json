@@ -81,11 +81,13 @@
 							"pm.test('Status code is 200', function () {",
 							"    pm.response.to.have.status(200);",
 							"});",
-							"pm.test('Returns strategy parameters schema', function () {",
+							"pm.test('Returns strategy parameters schema including RSI veto bounds', function () {",
 							"    var jsonData = pm.response.json();",
 							"    pm.expect(jsonData).to.have.property('opt_threshold');",
 							"    pm.expect(jsonData).to.have.property('opt_sl_mult');",
 							"    pm.expect(jsonData).to.have.property('live_approved');",
+							"    pm.expect(jsonData).to.have.property('rsi_buy_max');",
+							"    pm.expect(jsonData).to.have.property('rsi_sell_min');",
 							"});"
 						],
 						"type": "text/javascript"
