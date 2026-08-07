@@ -49,6 +49,8 @@ class StrategyParamsOut(BaseModel):
     opt_threshold: float
     opt_sl_mult: float
     opt_tp_mult: float
+    rsi_buy_max: float = 70.0    # Dynamic upper RSI ceiling
+    rsi_sell_min: float = 30.0   # Dynamic lower RSI floor
     live_approved: bool
     forecast_id: Optional[int] = None
     bullish_prob: Optional[float] = None
