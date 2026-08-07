@@ -22,21 +22,25 @@ and the raw OpenAPI schema at /openapi.json - no separate Swagger file to
 maintain; both stay in sync with this file automatically.
 """
 import asyncio
+import json
 import logging
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status
 from dotenv import load_dotenv
+import pandas as pd
 
 load_dotenv()
 
+from db.redis_client import redis_client
 from startup.db import close_db_pool, get_pool, init_db_pool
 from startup.schemas import HealthOut, StrategyParamsOut, TelemetryIn, TickIn
 from startup.jobs.feature_pull import pull_feature_window
-from startup.jobs.ml_tier2 import evaluate_tier2_signal
+from startup.jobs.ml_tier2 import evaluate_tier2_signal, train_neural_maps
 from startup.auth import verify_api_key
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -58,6 +62,54 @@ def validate_groq_model() -> str:
     return model
 
 
+async def cache_tick_to_redis(asset: str, tick_data: dict):
+    """Saves tick to Redis ZSET and trims data older than 45 minutes."""
+    current_time = time.time()
+    redis_key = f"ticks:{asset}"
+    
+    try:
+        # 1. Add to Sorted Set (Score = timestamp, Value = JSON)
+        await redis_client.zadd(redis_key, {json.dumps(tick_data): current_time})
+        
+        # 2. Trim old data (Calculate timestamp for 45 minutes ago)
+        cutoff_time = current_time - (45 * 60)
+        await redis_client.zremrangebyscore(redis_key, "-inf", cutoff_time)
+    except Exception as e:
+        logger.warning(f"Redis cache_tick_to_redis failed for {asset}: {e}")
+
+
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculates Average True Range for reward normalization."""
+    if 'high' not in df.columns or 'low' not in df.columns or 'close' not in df.columns:
+        return pd.Series(1e-5, index=df.index)
+        
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = ranges.max(axis=1)
+    
+    return true_range.rolling(period).mean()
+
+
+async def fetch_recent_telemetry() -> pd.DataFrame:
+    """Helper function to fetch telemetry records joined with tick feature context."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT tt.profit, te.ma_spread_delta, te.price_velocity_1m, te.rsi, te.rvol
+            FROM trade_telemetry tt
+            LEFT JOIN LATERAL (
+                SELECT * FROM tick_telemetry 
+                WHERE asset = tt.asset AND ts <= tt.created_at 
+                ORDER BY ts DESC LIMIT 1
+            ) te ON true
+            WHERE tt.created_at >= NOW() - INTERVAL '30 days'
+        """)
+    return pd.DataFrame([dict(r) for r in rows])
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_groq_model()
@@ -68,35 +120,22 @@ async def lifespan(app: FastAPI):
     try:
         from startup.jobs.groq_forecast import run_forecast_cycle
         from startup.jobs.gatekeeper import run_gatekeeper_cycle
-        from startup.jobs.ml_tier2 import train_neural_maps
-        import pandas as pd
 
-        # Job function for periodic model re-training[cite: 15]
+        # Job function for periodic model re-training
         async def run_retrain_cycle():
-            pool = get_pool()
-            async with pool.acquire() as conn:
-                # Join trade telemetry with nearest tick telemetry for feature context[cite: 15]
-                rows = await conn.fetch("""
-                    SELECT tt.profit, te.ma_spread_delta, te.price_velocity_1m, te.rsi, te.rvol
-                    FROM trade_telemetry tt
-                    LEFT JOIN LATERAL (
-                        SELECT * FROM tick_telemetry 
-                        WHERE asset = tt.asset AND ts <= tt.created_at 
-                        ORDER BY ts DESC LIMIT 1
-                    ) te ON true
-                    WHERE tt.created_at >= NOW() - INTERVAL '30 days'
-                """)
-            df = pd.DataFrame([dict(r) for r in rows])
-            if len(df) >= 50:  # Enforce minimum sample size[cite: 15]
-                # Execute in thread worker pool to avoid blocking async event loop[cite: 15]
+            df = await fetch_recent_telemetry()
+            if len(df) >= 50:  # Enforce minimum sample size
+                # Execute in thread worker pool to avoid blocking async event loop
                 await asyncio.to_thread(train_neural_maps, df)
                 logger.info(f"Retrained Triple Neural Map on {len(df)} recent trades.")
+            else:
+                logger.info(f"[Retrain] Insufficient telemetry sample size ({len(df)}/50). Skipping cycle.")
 
         # Schedule background tasks
         scheduler.add_job(run_forecast_cycle, "interval", minutes=15, id="run_forecast_cycle")
         scheduler.add_job(run_gatekeeper_cycle, "interval", hours=1, id="run_gatekeeper_cycle")
         
-        # Evolve ML models every 6 hours based on the latest regime[cite: 15]
+        # Evolve ML models every 6 hours based on the latest regime
         scheduler.add_job(run_retrain_cycle, "interval", hours=6, id="run_retrain_cycle")
 
         scheduler.start()
@@ -149,7 +188,11 @@ async def get_strategy_params(asset: str):
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT asset, opt_threshold, opt_sl_mult, opt_tp_mult, live_approved FROM strategy_db WHERE asset = $1",
+            """
+            SELECT asset, opt_threshold, opt_sl_mult, opt_tp_mult, 
+                   rsi_buy_max, rsi_sell_min, live_approved 
+            FROM strategy_db WHERE asset = $1
+            """,
             asset,
         )
         if not row:
@@ -178,6 +221,8 @@ async def get_strategy_params(asset: str):
         opt_threshold=opt_threshold,
         opt_sl_mult=float(row["opt_sl_mult"]) if row["opt_sl_mult"] is not None else 1.5,
         opt_tp_mult=float(row["opt_tp_mult"]) if row["opt_tp_mult"] is not None else 3.0,
+        rsi_buy_max=float(row["rsi_buy_max"]) if row["rsi_buy_max"] is not None else 70.0,
+        rsi_sell_min=float(row["rsi_sell_min"]) if row["rsi_sell_min"] is not None else 30.0,
         live_approved=bool(row["live_approved"]),
         forecast_id=forecast["id"] if forecast else None,
         bullish_prob=bullish_prob,
@@ -195,7 +240,7 @@ async def get_strategy_params(asset: str):
     tags=["Data Feed"],
     summary="Ingest Bar/Tick Feature Snapshot",
 )
-async def post_ticks(payload: TickIn):
+async def post_ticks(payload: TickIn, background_tasks: BackgroundTasks):
     pool = get_pool()
     try:
         async with pool.acquire() as conn:
@@ -212,6 +257,10 @@ async def post_ticks(payload: TickIn):
     except Exception:
         logger.exception("Failed to insert tick_telemetry row for %s", payload.asset)
         raise HTTPException(status_code=500, detail="Failed to store tick.")
+
+    # Enqueue background dual-write & 45-minute TTL cache trimming
+    background_tasks.add_task(cache_tick_to_redis, payload.asset, payload.model_dump())
+
     return {"status": "created", "asset": payload.asset}
 
 
@@ -240,3 +289,21 @@ async def post_telemetry(payload: TelemetryIn):
         logger.exception("Failed to insert trade_telemetry row for %s", payload.asset)
         raise HTTPException(status_code=500, detail="Failed to store telemetry.")
     return {"status": "logged", "asset": payload.asset}
+
+
+@app.post(
+    "/retrain",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(verify_api_key)],
+    tags=["ML Engine"],
+    summary="Trigger Async Model Retraining Cycle",
+)
+async def trigger_retrain(background_tasks: BackgroundTasks):
+    """Manual or Webhook trigger to run model retraining asynchronously."""
+    telemetry_df = await fetch_recent_telemetry()
+    
+    if telemetry_df.empty or len(telemetry_df) < 50:
+        raise HTTPException(status_code=400, detail="Insufficient telemetry data found to retrain (< 50 records).")
+    
+    background_tasks.add_task(asyncio.to_thread, train_neural_maps, telemetry_df)
+    return {"status": "retraining_initiated", "records": len(telemetry_df)}
