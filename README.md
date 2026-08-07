@@ -12,9 +12,9 @@ Project Kenjin is a highly automated, multi-asset algorithmic trading engine. It
 
 1. **Data Ingestion:** The MT5 Expert Advisor (EA) watches the markets on your FBS terminal. At the close of every bar, it sends a snapshot of indicators (TEMA, AC, RSI, Volume, etc.) to the local Python Orchestrator.
 2. **Storage:** The Orchestrator saves this tick data into your Supabase PostgreSQL database.
-3. **Forecasting (Every 30 mins):** A background scheduler grabs the last 30 minutes of data, formats it, and sends it to Groq (an ultra-fast LLM). Groq analyses the trend and returns a bullish/bearish probability alongside optimised Take Profit and Stop Loss multipliers.
+3. **Forecasting (Every 15 mins):** A background scheduler grabs the last 30 minutes of data, formats it, and sends it to Groq (an ultra-fast LLM). Groq analyses the trend and returns a bullish/bearish probability alongside optimised Take Profit and Stop Loss multipliers.
 4. **Execution:** Before placing a trade, the MT5 EA checks the Orchestrator for the latest Groq forecast and strategy parameters. If conditions match, it executes the trade on FBS MT5.
-5. **Gatekeeping (Every 4 hours):** A background job evaluates all closed trades. If a strategy's win rate drops below 55% or its profit factor drops below 1.3, the system automatically revokes its "live approved" status.
+5. **Gatekeeping (Every 1 hours):** A background job evaluates all closed trades. If a strategy's win rate drops below 55% or its profit factor drops below 1.3, the system automatically revokes its "live approved" status.
 
 ---
 
