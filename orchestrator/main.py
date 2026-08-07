@@ -37,11 +37,6 @@ from startup.db import close_db_pool, get_pool, init_db_pool
 from startup.schemas import HealthOut, StrategyParamsOut, TelemetryIn, TickIn
 from startup.jobs.feature_pull import pull_feature_window
 from startup.jobs.ml_tier2 import evaluate_tier2_signal
-# Single definition of auth lives in startup/auth.py - the local
-# `async def verify_api_key(...)` that used to sit here was a second,
-# shadowing definition of the same thing (the import was never actually
-# used - Python silently let the later def win). Same duplication pattern
-# as the routes, just smaller. There is now exactly one.
 from startup.auth import verify_api_key
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -49,11 +44,6 @@ logger = logging.getLogger("orchestrator")
 
 scheduler = AsyncIOScheduler()
 
-# Groq model IDs are lowercase/hyphenated/slash-namespaced, e.g.
-# "openai/gpt-oss-20b". A malformed GROQ_MODEL env var caused every forecast
-# cycle to 404 for two full log cycles before anyone noticed, because the
-# failure only surfaced 15-30 minutes after startup, inside a background job.
-# Fail here instead, before the app accepts any traffic.
 _VALID_MODEL_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*(/[a-z0-9]+(-[a-z0-9]+)*)*$")
 
 
@@ -78,22 +68,39 @@ async def lifespan(app: FastAPI):
     try:
         from startup.jobs.groq_forecast import run_forecast_cycle
         from startup.jobs.gatekeeper import run_gatekeeper_cycle
-        # auto_tester intentionally NOT imported/scheduled - see
-        # auto_tester_review.md. ShutdownTerminal=1 in auto_tester.py's .ini
-        # points MT5_PATH at "FBS MetaTrader 5.lnk" on the Public Desktop -
-        # the same shortcut the live/demo terminal runs from, not a separate
-        # dedicated test install. Re-enable only once MT5_PATH points at a
-        # genuinely separate instance that has never logged into the trading
-        # account.
-        # from startup.jobs.auto_tester import continuous_tester_cycle
+        from startup.jobs.ml_tier2 import train_neural_maps
+        import pandas as pd
+
+        # Job function for periodic model re-training[cite: 15]
+        async def run_retrain_cycle():
+            pool = get_pool()
+            async with pool.acquire() as conn:
+                # Join trade telemetry with nearest tick telemetry for feature context[cite: 15]
+                rows = await conn.fetch("""
+                    SELECT tt.profit, te.ma_spread_delta, te.price_velocity_1m, te.rsi, te.rvol
+                    FROM trade_telemetry tt
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM tick_telemetry 
+                        WHERE asset = tt.asset AND ts <= tt.created_at 
+                        ORDER BY ts DESC LIMIT 1
+                    ) te ON true
+                    WHERE tt.created_at >= NOW() - INTERVAL '30 days'
+                """)
+            df = pd.DataFrame([dict(r) for r in rows])
+            if len(df) >= 50:  # Enforce minimum sample size[cite: 15]
+                # Execute in thread worker pool to avoid blocking async event loop[cite: 15]
+                await asyncio.to_thread(train_neural_maps, df)
+                logger.info(f"Retrained Triple Neural Map on {len(df)} recent trades.")
 
         # Schedule background tasks
         scheduler.add_job(run_forecast_cycle, "interval", minutes=15, id="run_forecast_cycle")
         scheduler.add_job(run_gatekeeper_cycle, "interval", hours=1, id="run_gatekeeper_cycle")
-        # scheduler.add_job(continuous_tester_cycle, "cron", hour=2, id="continuous_tester_cycle")
+        
+        # Evolve ML models every 6 hours based on the latest regime[cite: 15]
+        scheduler.add_job(run_retrain_cycle, "interval", hours=6, id="run_retrain_cycle")
 
         scheduler.start()
-        logger.info("APScheduler initialized: Forecast (15m), Gatekeeper (1h). AutoTester DISABLED - see auto_tester_review.md.")
+        logger.info("APScheduler initialized: Forecast (15m), Gatekeeper (1h), ML Retrain (6h). AutoTester DISABLED - see auto_tester_review.md.")
     except Exception as e:
         logger.warning(f"Failed scheduling background jobs: {e}")
 
@@ -157,10 +164,6 @@ async def get_strategy_params(asset: str):
     bearish_prob = float(forecast["bearish_prob"]) if forecast and forecast["bearish_prob"] is not None else 50.0
     opt_threshold = float(row["opt_threshold"]) if row["opt_threshold"] is not None else 0.60
 
-    # Tier-2 is experimental (untrained model, feature-name mismatch against
-    # tick_telemetry - see the prior review). It must never be able to take
-    # down the one endpoint v10 depends on for basic threshold/SL/TP sync,
-    # so a failure here degrades to HOLD/neutral rather than a 500.
     try:
         df = await pull_feature_window(asset, minutes=30)
         tier2 = await asyncio.to_thread(
