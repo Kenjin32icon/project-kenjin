@@ -67,7 +67,6 @@ input double   InpRiskPercentPerTrade = 2.0;
 input double   InpMinLot              = 0.01;
 input double   InpMaxLot              = 5.00;
 input double   InpMarginBufferUSD     = 0.50; 
-// Note: InpBlockOversizedMicroRisk and InpMicroRiskTolerance were removed as they were dead code.
 
 input string   InpSection8            = "==== Trailing (SAR-driven) ====";
 input bool     InpUseSarTrailing      = true;
@@ -90,10 +89,10 @@ input string   InpSection11           = "==== Circuit Breakers ====";
 input double   InpMaxDailyLossPercent = 5.0;
 input double   InpMaxDrawdownPercent  = 15.0;
 input int      InpMaxConsecutiveLosses= 5;
-input double   InpMaxFloatingLossPercent = 3.0; // NEW: Floating loss kill-switch
+input double   InpMaxFloatingLossPercent = 3.0; // Floating loss kill-switch
 
 //=====================================================================
-// GLOBAL VARIABLES
+// GLOBAL VARIABLES & STRUCTS
 //=====================================================================
 CTrade         trade;
 CPositionInfo  posInfo;
@@ -123,6 +122,21 @@ long     db_latest_forecast_id= -1;
 string   db_tier2_action      = "HOLD";
 double   db_tier2_confidence  = 0.0;
 double   db_tier2_lot_mult    = 1.0;
+
+// Dynamic Orchestrator Parameters Struct
+struct StrategyParams
+  {
+   double opt_threshold;
+   double opt_sl_mult;
+   double opt_tp_mult;
+   double rsi_buy_max;     // Dynamic upper RSI ceiling
+   double rsi_sell_min;    // Dynamic lower RSI floor
+   bool   live_approved;
+   string tier2_action;
+   double recommended_lot_multiplier;
+  };
+
+StrategyParams CurrentParams = {0.60, 1.5, 3.0, 70.0, 30.0, false, "HOLD", 1.0};
 
 //+------------------------------------------------------------------+
 //| One struct = one snapshot of every indicator, shared by both the |
@@ -286,21 +300,28 @@ bool FetchStrategyParams(string asset)
      }
 
    double v;
-   if(JsonGetNumber(body, "opt_threshold", v)) db_opt_threshold = v;
-   if(JsonGetNumber(body, "opt_sl_mult", v))    db_opt_sl_mult   = v;
-   if(JsonGetNumber(body, "opt_tp_mult", v))    db_opt_tp_mult   = v;
+   if(JsonGetNumber(body, "opt_threshold", v)) { db_opt_threshold = v; CurrentParams.opt_threshold = v; }
+   if(JsonGetNumber(body, "opt_sl_mult", v))    { db_opt_sl_mult   = v; CurrentParams.opt_sl_mult = v; }
+   if(JsonGetNumber(body, "opt_tp_mult", v))    { db_opt_tp_mult   = v; CurrentParams.opt_tp_mult = v; }
    bool lv;
-   if(JsonGetBool(body, "live_approved", lv))   db_live_approved = lv;
+   if(JsonGetBool(body, "live_approved", lv))   { db_live_approved = lv; CurrentParams.live_approved = lv; }
    double fid;
    if(JsonGetNumber(body, "forecast_id", fid))  db_latest_forecast_id = (long)fid;
    else                                         db_latest_forecast_id = -1;
 
-   JsonGetString(body, "tier2_action", db_tier2_action);
+   if(JsonGetString(body, "tier2_action", db_tier2_action)) CurrentParams.tier2_action = db_tier2_action;
    if(JsonGetNumber(body, "tier2_confidence", v)) db_tier2_confidence = v;
-   if(JsonGetNumber(body, "recommended_lot_multiplier", v)) db_tier2_lot_mult = v;
+   if(JsonGetNumber(body, "recommended_lot_multiplier", v)) { db_tier2_lot_mult = v; CurrentParams.recommended_lot_multiplier = v; }
 
-   PrintFormat("Orchestrator params loaded for '%s' -> Threshold=%.2f SL=%.2f TP=%.2f Tier2Action=%s LotMult=%.2f",
-               asset, db_opt_threshold, db_opt_sl_mult, db_opt_tp_mult, db_tier2_action, db_tier2_lot_mult);
+   // Dynamic RSI Veto Boundaries with Fallbacks
+   if(JsonGetNumber(body, "rsi_buy_max", v)) CurrentParams.rsi_buy_max = v;
+   else CurrentParams.rsi_buy_max = 70.0;
+
+   if(JsonGetNumber(body, "rsi_sell_min", v)) CurrentParams.rsi_sell_min = v;
+   else CurrentParams.rsi_sell_min = 30.0;
+
+   PrintFormat("Parameters Updated | Asset: %s | RSI Max: %.1f | RSI Min: %.1f | Thresh: %.2f | Action: %s", 
+               asset, CurrentParams.rsi_buy_max, CurrentParams.rsi_sell_min, CurrentParams.opt_threshold, CurrentParams.tier2_action);
    return(true);
   }
 
@@ -468,15 +489,14 @@ bool HasOpenPosition(long &type)
    if(PositionSelect(_Symbol))
       if(posInfo.Magic() == InpMagicNumber) { type = posInfo.PositionType(); return(true); }
    return(false);
-}
+  }
 
-// Floating loss kill-switch implementation
 void CheckFloatingLossKillSwitch()
   {
    long type;
    if(!HasOpenPosition(type)) return;
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double floatingLoss = -posInfo.Profit(); // positive number if losing
+   double floatingLoss = -posInfo.Profit();
    double floatingLossPct = (equity > 0) ? (floatingLoss / equity) * 100.0 : 0.0;
 
    if(floatingLossPct >= InpMaxFloatingLossPercent)
@@ -525,7 +545,7 @@ double GetEffectiveRiskPercent()
 
 double GetEffectiveThreshold()
   {
-   double baseThresh = UsingRemoteParams() ? db_opt_threshold : InpScoreThresholdOpen;
+   double baseThresh = UsingRemoteParams() ? CurrentParams.opt_threshold : InpScoreThresholdOpen;
    double boost = MathMin(consecutiveLosses * 0.05, 0.20);
    return(MathMin(baseThresh + boost, 0.95));
   }
@@ -604,8 +624,12 @@ double ComputeSignalScore(SignalContext &ctx)
       ctx.rsi = rsiBuf[0];
       if(InpUseRsiFilter)
         {
-         if(finalScore > 0 && ctx.rsi >= InpRsiOverbought) finalScore = 0.0;
-         else if(finalScore < 0 && ctx.rsi <= InpRsiOversold) finalScore = 0.0;
+         // Evaluate dynamic RSI Veto Boundaries
+         double rsiBuyMax  = UsingRemoteParams() ? CurrentParams.rsi_buy_max : InpRsiOverbought;
+         double rsiSellMin = UsingRemoteParams() ? CurrentParams.rsi_sell_min : InpRsiOversold;
+
+         if(finalScore > 0 && ctx.rsi >= rsiBuyMax) finalScore = 0.0;
+         else if(finalScore < 0 && ctx.rsi <= rsiSellMin) finalScore = 0.0;
         }
      }
 
@@ -634,8 +658,8 @@ double CalculateLotSize(double slDistancePrice, double &lots, double &requiredMa
    double lossPerLot = (slDistancePrice / tickSize) * tickValue;
    if(lossPerLot <= 0) { lots = InpMinLot; requiredMargin = 0; return(riskPct); }
 
-   // Incorporate Tier-2 Recommended Lot Multiplier from Orchestrator
-   double rawLots = (riskMoney / lossPerLot) * db_tier2_lot_mult;
+   double lotMult = UsingRemoteParams() ? CurrentParams.recommended_lot_multiplier : db_tier2_lot_mult;
+   double rawLots = (riskMoney / lossPerLot) * lotMult;
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    if(lotStep > 0) rawLots = MathFloor(rawLots / lotStep) * lotStep;
 
@@ -654,7 +678,8 @@ bool NewEntriesAllowed()
    if(consecutiveLosses >= InpMaxConsecutiveLosses) return(false);
    if(InpUseOrchestrator && !orchestratorHealthy) return(false);
 
-   if(InpEnforceLiveApproval && !IsDemoAccount() && !db_live_approved) return(false);
+   bool liveApproved = UsingRemoteParams() ? CurrentParams.live_approved : db_live_approved;
+   if(InpEnforceLiveApproval && !IsDemoAccount() && !liveApproved) return(false);
 
    double dayPL = ComputeTodaysRealizedPL();
    if(dayStartEquity > 0)
@@ -671,15 +696,16 @@ void TryOpenTrade(double score, SignalContext &ctx)
    if(!GetAtr(atr)) return;
    if(!NewEntriesAllowed()) return;
 
-   // Confirm entry with Tier-2 Action if active
-   if(InpUseOrchestrator && db_tier2_action != "HOLD")
+   string tier2Action = UsingRemoteParams() ? CurrentParams.tier2_action : db_tier2_action;
+
+   if(InpUseOrchestrator && tier2Action != "HOLD")
      {
-      if(db_tier2_action == "BUY" && score < GetEffectiveThreshold()) return;
-      if(db_tier2_action == "SELL" && score > -GetEffectiveThreshold()) return;
+      if(tier2Action == "BUY" && score < GetEffectiveThreshold()) return;
+      if(tier2Action == "SELL" && score > -GetEffectiveThreshold()) return;
      }
 
-   double slMult = UsingRemoteParams() ? db_opt_sl_mult : InpAtrSLMultiplier;
-   double tpMult = UsingRemoteParams() ? db_opt_tp_mult : InpAtrTPMultiplier;
+   double slMult = UsingRemoteParams() ? CurrentParams.opt_sl_mult : InpAtrSLMultiplier;
+   double tpMult = UsingRemoteParams() ? CurrentParams.opt_tp_mult : InpAtrTPMultiplier;
 
    double slDist = atr * slMult;
    double tpDist = atr * tpMult;
@@ -696,7 +722,7 @@ void TryOpenTrade(double score, SignalContext &ctx)
    double threshold = GetEffectiveThreshold();
    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
 
-   if(score >= threshold || db_tier2_action == "BUY")
+   if(score >= threshold || tier2Action == "BUY")
      {
       double sl = NormalizeDouble(ask - slDist, _Digits);
       double tp = NormalizeDouble(ask + tpDist, _Digits);
@@ -711,7 +737,7 @@ void TryOpenTrade(double score, SignalContext &ctx)
            }
         }
      }
-   else if(score <= -threshold || db_tier2_action == "SELL")
+   else if(score <= -threshold || tier2Action == "SELL")
      {
       double sl = NormalizeDouble(bid + slDist, _Digits);
       double tp = NormalizeDouble(bid - tpDist, _Digits);
@@ -788,7 +814,7 @@ void ManageTimeExits()
 
 void OnTick()
   {
-   CheckFloatingLossKillSwitch(); // 1. Run emergency risk checks first
+   CheckFloatingLossKillSwitch();
 
    RefreshDailyCounter();
    UpdateDrawdownState();
@@ -805,17 +831,13 @@ void OnTick()
    if(HasOpenPosition(type))
      {
       ManageExitOnReversal(score);
-      // Ensure we still post ticks even if holding a position
       PostTick(NormalizeAssetKey(), ctx); 
       return;
      }
 
    if(!IsWithinTradingSession()) return;
 
-   // 2. Execute trade decisions immediately
    TryOpenTrade(score, ctx);
-   
-   // 3. Post telemetry AFTER the trade entry decision to prevent latency blocks
    PostTick(NormalizeAssetKey(), ctx);
   }
 
