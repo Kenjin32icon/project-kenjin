@@ -123,7 +123,7 @@ ShutdownTerminal=1
 
 
 async def analyze_missed_trades_with_groq(asset: str, optimization_data: dict) -> None:
-    """Uses Groq to find why 5-min trades are failing based on optimization data."""
+    """Uses Groq to analyze 5-min trade failures and output structured RSI limit tweaks."""
     api_key = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
         log.error("GROQ_API_KEY environment variable missing.")
@@ -131,10 +131,15 @@ async def analyze_missed_trades_with_groq(asset: str, optimization_data: dict) -
 
     client = AsyncGroq(api_key=api_key)
     prompt = f"""
-    You are a quantitative analyst. Review this 5-minute timeframe optimization data for {asset}.
-    The current system is missing micro-trend executions or executing trades that fail to reach profit.
-    Analyze the parameter failures. Respond strictly with ONLY a raw JSON object, no markdown fences:
-    {{"identified_issue": "string", "suggested_logic_tweak": "string"}}
+    You are a quantitative analyst. Review this 5-minute optimization data for {asset}.
+    Identify whether trades were blocked by overly strict RSI veto limits (standard 30/70).
+    Respond STRICTLY with a single JSON object containing these exact keys:
+    {{
+        "identified_issue": "string",
+        "suggested_logic_tweak": "string",
+        "suggested_rsi_buy_max": float,  # Value between 60.0 and 85.0
+        "suggested_rsi_sell_min": float  # Value between 15.0 and 40.0
+    }}
     
     Data: {json.dumps(optimization_data)}
     """
@@ -142,7 +147,7 @@ async def analyze_missed_trades_with_groq(asset: str, optimization_data: dict) -
     completion = await client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[{"role": "system", "content": prompt}],
-        temperature=0.2,
+        temperature=0.1,
     )
 
     raw = completion.choices[0].message.content.strip()
@@ -158,14 +163,19 @@ async def analyze_missed_trades_with_groq(asset: str, optimization_data: dict) -
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO missed_trade_analytics (asset, groq_analysis, suggested_logic_tweak)
+            INSERT INTO missed_trade_analytics 
+            (asset, groq_analysis, suggested_logic_tweak)
             VALUES ($1, $2, $3)
             """,
             asset, 
             analysis.get("identified_issue", ""), 
-            analysis.get("suggested_logic_tweak", "")
+            json.dumps({
+                "tweak": analysis.get("suggested_logic_tweak", ""),
+                "suggested_rsi_buy_max": analysis.get("suggested_rsi_buy_max", 70.0),
+                "suggested_rsi_sell_min": analysis.get("suggested_rsi_sell_min", 30.0)
+            })
         )
-    log.info(f"Groq analysis complete for {asset} 5-min inefficiency.")
+    log.info(f"Groq structured analysis recorded for {asset}.")
 
 
 async def continuous_tester_cycle() -> None:
