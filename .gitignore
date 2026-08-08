@@ -7,3 +7,4 @@ orchestrator/__pycache__/main.cpython-312.pyc
 startup/__pycache__
 startup/jobs/__pycache__
 reports
+db/__pycache__/redis_client.cpython-311.pyc
