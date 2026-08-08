@@ -57,7 +57,7 @@ Create a file named `.env` in the root directory. You will need a Supabase accou
 Start the FastAPI Orchestrator using Uvicorn. Keep this terminal open; it acts as the brain of the operation.
 
 ```bash
-uvicorn orchestrator.main:app --host 127.0.0.1 --port 8000
+uvicorn orchestrator.main:app --host 127.0.0.1 --port 8000 --env-file .env
 
 ```
 
