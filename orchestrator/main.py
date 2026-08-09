@@ -174,6 +174,7 @@ async def lifespan(app: FastAPI):
         from startup.jobs.groq_forecast import run_forecast_cycle
         from startup.jobs.gatekeeper import run_gatekeeper_cycle
         from startup.jobs.hour_scheduler import run_hour_scheduler_cycle
+        from startup.jobs.confidence_calibration import run_calibration_cycle
 
         async def run_retrain_cycle():
             df = await fetch_recent_telemetry()
@@ -186,13 +187,17 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(run_forecast_cycle, "interval", minutes=15, id="run_forecast_cycle")
         scheduler.add_job(run_gatekeeper_cycle, "interval", hours=1, id="run_gatekeeper_cycle")
         scheduler.add_job(run_retrain_cycle, "interval", hours=6, id="run_retrain_cycle")
-        # v11: NEW - populates strategy_db.scheduled_start_hour/end_hour
+        # v11: populates strategy_db.scheduled_start_hour/end_hour
         scheduler.add_job(run_hour_scheduler_cycle, "interval", hours=12, id="run_hour_scheduler_cycle")
+        # v11.1: NEW - validates tier2_confidence against real outcomes, populates
+        # strategy_db.calibration_score/calibration_n
+        scheduler.add_job(run_calibration_cycle, "interval", hours=24, id="run_calibration_cycle")
 
         scheduler.start()
         logger.info(
             "APScheduler initialized: Forecast (15m), Gatekeeper (1h), ML Retrain (6h), "
-            "Hour Scheduler (12h). AutoTester DISABLED - see auto_tester_review.md."
+            "Hour Scheduler (12h), Confidence Calibration (24h). "
+            "AutoTester DISABLED - see auto_tester_review.md."
         )
     except Exception as e:
         logger.warning(f"Failed scheduling background jobs: {e}")
@@ -206,7 +211,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="PROJECT KENJIN - Quant Matrix Orchestrator",
     description="High-frequency EA telemetry, indicator snapshot ingestion, and multi-tier strategy parameter sync API.",
-    version="11.0.0",
+    version="11.1.0",
     lifespan=lifespan,
 )
 
@@ -244,7 +249,8 @@ async def get_strategy_params(asset: str):
             """
             SELECT asset, opt_threshold, opt_sl_mult, opt_tp_mult,
                    rsi_buy_max, rsi_sell_min, live_approved,
-                   scheduled_start_hour, scheduled_end_hour
+                   scheduled_start_hour, scheduled_end_hour,
+                   calibration_score, calibration_n
             FROM strategy_db WHERE asset = $1
             """,
             asset,
@@ -261,10 +267,25 @@ async def get_strategy_params(asset: str):
     bearish_prob = float(forecast["bearish_prob"]) if forecast and forecast["bearish_prob"] is not None else 50.0
     opt_threshold = float(row["opt_threshold"]) if row["opt_threshold"] is not None else 0.60
 
+    # v11.1: derive a calibration multiplier from confidence_calibration.py's output.
+    # Not enough validated history yet -> derate meaningfully (0.6x). Enough history
+    # but the model's stated confidence hasn't tracked real outcomes well (Brier
+    # score worse than an uninformative 0.5 guess) -> derate moderately (0.75x).
+    # Otherwise leave lot sizing exactly as Tier-2 computed it (1.0x).
+    calibration_n = row["calibration_n"]
+    calibration_score = row["calibration_score"]
+    if calibration_n is None or int(calibration_n) < 30:
+        calibration_multiplier = 0.6
+    elif calibration_score is not None and float(calibration_score) > 0.25:
+        calibration_multiplier = 0.75
+    else:
+        calibration_multiplier = 1.0
+
     try:
         df = await get_hot_feature_window(asset, minutes=30)
         tier2 = await asyncio.to_thread(
-            evaluate_tier2_signal, df, bullish_prob, bearish_prob, opt_threshold
+            evaluate_tier2_signal, df, bullish_prob, bearish_prob, opt_threshold,
+            1.0, calibration_multiplier,
         )
     except Exception:
         logger.exception("Tier-2 evaluation failed for %s - degrading to HOLD/neutral.", asset)
@@ -319,12 +340,13 @@ async def post_telemetry(payload: TelemetryIn):
             await conn.execute(
                 """
                 INSERT INTO trade_telemetry
-                (asset, type, price, lots, profit, rsi, entry_score, sl_price, tp_price, magic_number, account_type, session_hour, forecast_id, ts)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+                (asset, type, price, lots, profit, rsi, entry_score, sl_price, tp_price, magic_number, account_type, session_hour, forecast_id, tier2_confidence, ts)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
                 """,
                 payload.asset, payload.type, payload.price, payload.lots, payload.profit,
                 payload.rsi, payload.entry_score, payload.sl_price, payload.tp_price,
                 payload.magic_number, payload.account_type, payload.session_hour, payload.forecast_id,
+                payload.tier2_confidence,
             )
     except Exception:
         logger.exception("Failed to insert trade_telemetry row for %s", payload.asset)
