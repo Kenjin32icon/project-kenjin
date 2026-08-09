@@ -153,8 +153,21 @@ def train_neural_maps(telemetry_df: pd.DataFrame, risk_value: float = 1.0, opt_t
     return True
 
 
-def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: float, opt_threshold: float, risk_value: float = 1.0) -> dict:
-    """Evaluates real-time ticks using the Triple Neural Map, falling back to heuristics if untrained."""
+def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: float, opt_threshold: float,
+                           risk_value: float = 1.0, calibration_multiplier: float = 1.0) -> dict:
+    """
+    Evaluates real-time ticks using the Triple Neural Map, falling back to heuristics if untrained.
+
+    calibration_multiplier (v11.1, new): supplied by main.py from
+    strategy_db.calibration_score/calibration_n, which confidence_calibration.py
+    computes from actual trade outcomes vs. the confidence recorded at entry
+    time. Defaults to 1.0 (no change) until an asset has enough validated
+    history - see confidence_calibration.py for the exact rule. This is what
+    makes "the model trusting itself more" evidence-gated rather than just a
+    number the model reports about itself: it can only size up toward the
+    2.5x ceiling once its own confidence has actually been checked against
+    what happened.
+    """
     if df.empty or len(df) < 5:
         return {"action": "HOLD", "confidence": 0.0, "lot_multiplier": 1.0}
 
@@ -184,6 +197,7 @@ def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: f
 
         confidence = p_profit
         lot_multiplier = max(0.5, min(2.5, 1.0 + (expected_value / risk_value)))
+        lot_multiplier = max(0.5, min(2.5, lot_multiplier * calibration_multiplier))
 
         return {
             "action": action,
@@ -218,6 +232,7 @@ def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: f
             action = "SELL"
 
         lot_multiplier = max(0.5, min(2.5, 1.0 + (abs(llm_bias) * 1.5)))
+        lot_multiplier = max(0.5, min(2.5, lot_multiplier * calibration_multiplier))
 
         return {
             "action": action,
