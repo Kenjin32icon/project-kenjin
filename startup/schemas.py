@@ -39,6 +39,7 @@ class TelemetryIn(BaseModel):
     account_type: Optional[str] = None  # 'demo' or 'live'
     session_hour: Optional[int] = None
     forecast_id: Optional[int] = None
+    tier2_confidence: Optional[float] = None  # v11.1: now actually sent by the EA - see PostTelemetry()
 
     class Config:
         populate_by_name = True
