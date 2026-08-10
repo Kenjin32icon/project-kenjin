@@ -53,7 +53,7 @@ from db.redis_client import redis_client
 from startup.db import close_db_pool, get_pool, init_db_pool
 from startup.schemas import HealthOut, StrategyParamsOut, TelemetryIn, TickIn
 from startup.jobs.feature_pull import pull_feature_window as pg_pull_feature_window
-from startup.jobs.ml_tier2 import evaluate_tier2_signal, train_neural_maps
+from startup.jobs.ml_tier2 import evaluate_tier2_signal, train_neural_maps, compute_micro_trend
 from startup.jobs.ml_tier2 import pull_feature_window as redis_pull_feature_window
 from startup.auth import verify_api_key
 
@@ -211,7 +211,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="PROJECT KENJIN - Quant Matrix Orchestrator",
     description="High-frequency EA telemetry, indicator snapshot ingestion, and multi-tier strategy parameter sync API.",
-    version="11.2.0",
+    version="11.3.0",
     lifespan=lifespan,
 )
 
@@ -308,9 +308,11 @@ async def get_strategy_params(asset: str):
             evaluate_tier2_signal, df, bullish_prob, bearish_prob, opt_threshold,
             1.0, calibration_multiplier,
         )
+        micro = compute_micro_trend(df)
     except Exception:
         logger.exception("Tier-2 evaluation failed for %s - degrading to HOLD/neutral.", asset)
         tier2 = {"action": "HOLD", "confidence": 0.0, "lot_multiplier": 1.0}
+        micro = {"micro_trend": "NEUTRAL", "micro_trend_strength": 0.0}
 
     return StrategyParamsOut(
         asset=row["asset"],
@@ -328,6 +330,8 @@ async def get_strategy_params(asset: str):
         recommended_lot_multiplier=tier2.get("lot_multiplier", 1.0),
         scheduled_start_hour=row["scheduled_start_hour"],
         scheduled_end_hour=row["scheduled_end_hour"],
+        micro_trend=micro.get("micro_trend", "NEUTRAL"),
+        micro_trend_strength=micro.get("micro_trend_strength", 0.0),
     )
 
 
