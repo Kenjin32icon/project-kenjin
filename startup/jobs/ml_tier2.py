@@ -88,6 +88,53 @@ async def pull_feature_window(symbol: str, window_minutes: int = 15) -> pd.DataF
     return df
 
 
+def compute_micro_trend(df: pd.DataFrame) -> dict:
+    """
+    v11.3: Short-horizon (~1-2 minute) statistical trend read, deliberately
+    independent of both the 15-minute Groq macro forecast and the LightGBM
+    Tier-2 models - pure arithmetic over the same feature window Tier-2
+    already has in memory, so it costs nothing extra to compute on every
+    /strategy_params call.
+
+    Purpose: give the EA something to check an ALREADY-OPEN position against
+    on a much tighter timeline than either of those two run on. Tier-2's
+    'action' answers "would I enter this trade right now" - it doesn't track
+    whether a trade already in flight is still going the right way on the
+    scale of the last minute or two. This does.
+    """
+    if df.empty or len(df) < 5:
+        return {"micro_trend": "NEUTRAL", "micro_trend_strength": 0.0}
+
+    latest = df.iloc[-1]
+    v1m = float(latest.get('price_velocity_1m', 0.0))
+    ma_delta = float(latest.get('ma_spread_delta', 0.0))
+    rvol = float(latest.get('rvol', 1.0))
+
+    raw = 0.0
+    if v1m > 0:
+        raw += 0.6
+    elif v1m < 0:
+        raw -= 0.6
+    if ma_delta > 0:
+        raw += 0.4
+    elif ma_delta < 0:
+        raw -= 0.4
+
+    # Thin/quiet tick activity makes a short-horizon read less trustworthy -
+    # dampen it rather than let a low-volume blip look like a strong signal.
+    raw *= min(1.5, max(0.5, rvol))
+
+    strength = min(1.0, abs(raw))
+    if raw >= 0.3:
+        trend = "BUY"
+    elif raw <= -0.3:
+        trend = "SELL"
+    else:
+        trend = "NEUTRAL"
+
+    return {"micro_trend": trend, "micro_trend_strength": round(strength, 3)}
+
+
 def get_models():
     """Loads models into memory once and reuses them."""
     global _model_cache
