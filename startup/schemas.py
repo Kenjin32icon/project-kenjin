@@ -59,6 +59,11 @@ class StrategyParamsOut(BaseModel):
     tier2_action: str = "HOLD"  # BUY, SELL, or HOLD
     tier2_confidence: float = 0.0
     recommended_lot_multiplier: float = 1.0
+    # v11.3: short-horizon (~1-2min) statistical trend, independent of
+    # tier2_action - see ml_tier2.py::compute_micro_trend(). Used by the EA
+    # to re-check an already-open position, not just at entry.
+    micro_trend: str = "NEUTRAL"
+    micro_trend_strength: float = 0.0
     # v11: predictive session scheduling, populated by hour_scheduler.py.
     # None until an asset has enough trade history - EA falls back to its
     # static session inputs in that case.
