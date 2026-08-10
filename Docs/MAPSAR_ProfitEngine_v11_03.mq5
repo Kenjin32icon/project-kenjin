@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|                                 MAPSAR_ProfitEngine_v11.mq5       |
+//|                                 MAPSAR_ProfitEngine_v11_03.mq5       |
 //|        Universal Multi-Asset & Micro/Macro Equity Profit Engine   |
 //|  TEMA + AC + SAR + RSI Veto + Volume + MA(10/20/50/100/200)+ADX   |
 //|  Local Orchestrator (FastAPI) Integration with Tier-2 ML Signals  |
@@ -31,9 +31,15 @@
 //|     falling back to the static session inputs otherwise             |
 //+------------------------------------------------------------------+
 #property copyright "InfoScience"
-#property version   "11.01"
+#property version   "11.03"
+// v11.03: NEW ManageMLReversalExit() - re-checks an OPEN position against
+// Tier-2's current action + a new short-horizon micro-trend signal on a
+// tightened refresh cadence (InpOpenPositionRefreshSeconds, default 60s vs
+// the normal 15min), closing if both have persistently turned against the
+// trade. Requires orchestrator v11.3 (adds micro_trend/micro_trend_strength
+// to /strategy_params - see ml_tier2.py::compute_micro_trend()).
 // v11.01: fixed PostTelemetry() to actually send tier2_confidence (was captured
-// but never transmitted) - required for the new confidence-calibration job.
+// but never transmitted) - required for the confidence-calibration job.
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -138,6 +144,12 @@ input string   InpSection13b          = "==== Optional Early Loss Cut (aggressiv
 input bool     InpEarlyLossCutEnabled = false;                       // OFF by default: cutting before SL is a real win-rate/whipsaw trade-off
 input double   InpEarlyLossCutRFraction = 0.6;                       // fraction of SL distance; only fires if momentum also confirms against
 
+input string   InpSection13c          = "==== ML-Informed In-Trade Reversal Exit (v11.3, NEW) ====";
+input bool     InpUseMLReversalExit   = true;                        // separate from ManageExitOnReversal(), which only uses the raw local score
+input int      InpMLReversalConfirmations = 2;                       // consecutive disagreeing param refreshes required before closing - avoids single-blip whipsaws
+input double   InpMicroTrendMinStrength = 0.4;                       // orchestrator's micro_trend_strength must clear this to count as a real disagreement
+input int      InpOpenPositionRefreshSeconds = 60;                   // v11.3: while a position is open, refresh params on THIS cadence instead of InpParamsRefetchMinutes - narrows the prediction timeline specifically for trades that have real money on them
+
 input string   InpSection14           = "==== Execution Heartbeat & Max Hold ====";
 input int      InpHeartbeatSeconds    = 30;                          // OnTimer cadence - safety net for quiet tick periods
 input int      InpMaxHoldMinutes      = 60;                          // hard safety cap only - NOT a profit/loss-blind timer like v10's 5 min
@@ -176,6 +188,9 @@ double   db_tier2_confidence   = 0.0;
 double   db_tier2_lot_mult     = 1.0;
 int      db_scheduled_start_hour = -1;  // v11: -1 = orchestrator hasn't scheduled a window yet -> fall back to static inputs
 int      db_scheduled_end_hour   = -1;
+string   db_micro_trend          = "NEUTRAL";  // v11.3: short-horizon (~1-2min) statistical read, independent of the 15-min macro forecast and Tier-2's own longer-horizon models
+double   db_micro_trend_strength = 0.0;
+int      mlReversalDisagreeCount = 0;   // v11.3: counts consecutive param-refreshes where Tier-2 AND micro-trend both disagree with the open position
 
 //+------------------------------------------------------------------+
 //| One struct = one snapshot of every indicator, shared by both the |
@@ -367,6 +382,12 @@ bool FetchStrategyParams(string asset)
    if(JsonGetNumber(body, "tier2_confidence", v)) db_tier2_confidence = v;
    if(JsonGetNumber(body, "recommended_lot_multiplier", v)) db_tier2_lot_mult = v;
 
+   // v11.3: short-horizon statistical trend read - narrows the prediction
+   // timeline for in-trade monitoring specifically (see ManageMLReversalExit()).
+   string mt;
+   if(JsonGetString(body, "micro_trend", mt)) db_micro_trend = mt; else db_micro_trend = "NEUTRAL";
+   if(JsonGetNumber(body, "micro_trend_strength", v)) db_micro_trend_strength = v; else db_micro_trend_strength = 0.0;
+
    // v11: predictive scheduling window, if the orchestrator's hour-scheduler job has populated it
    double sh, eh;
    if(JsonGetNumber(body, "scheduled_start_hour", sh)) db_scheduled_start_hour = (int)sh; else db_scheduled_start_hour = -1;
@@ -517,14 +538,28 @@ void OnDeinit(const int reason)
    IndicatorRelease(hMA100); IndicatorRelease(hMA200);
   }
 
+// v11.3: refreshes on a much tighter cadence (InpOpenPositionRefreshSeconds,
+// default 60s) while a position is open, vs the normal InpParamsRefetchMinutes
+// (default 15min) while flat. This is what "narrows the prediction timeline"
+// specifically for trades that currently have money on them, without hammering
+// the orchestrator when there's nothing open to monitor.
 void RefreshParamsIfDue()
   {
    if(!InpUseOrchestrator) return;
-   if((TimeCurrent() - lastParamsFetch) < InpParamsRefetchMinutes * 60) return;
+
+   long posType;
+   bool hasPos = HasOpenPosition(posType);
+   int intervalSeconds = hasPos ? InpOpenPositionRefreshSeconds : (InpParamsRefetchMinutes * 60);
+   if((TimeCurrent() - lastParamsFetch) < intervalSeconds) return;
 
    CheckOrchestratorHealth();
-   FetchStrategyParams(NormalizeAssetKey());
+   bool fetched = FetchStrategyParams(NormalizeAssetKey());
    lastParamsFetch = TimeCurrent();
+
+   // Only re-check ML-reversal disagreement against genuinely fresh data -
+   // a failed fetch leaves db_tier2_action/db_micro_trend stale, and re-running
+   // the check against stale values would let the same disagreement count twice.
+   if(fetched) ManageMLReversalExit();
   }
 
 bool IsNewBar()
@@ -693,6 +728,51 @@ void ManageEarlyLossCut()
 
    PrintFormat("EARLY LOSS CUT: %.0f%% of SL distance reached with momentum confirming against. Closing early.", adverseFraction * 100.0);
    trade.PositionClose(_Symbol);
+  }
+
+// v11.3: NEW - the profit-peak exit and kill switch react to P&L; the
+// existing ManageExitOnReversal() reacts to the EA's own raw local score.
+// Neither of those ever asks "does the model's CURRENT live view still agree
+// with a trade it's already in?" - Tier-2 and the micro-trend signal were
+// only ever consulted at entry, then the trade ran on its own until close.
+// This closes that gap: while a position is open, RefreshParamsIfDue() (now
+// on a much tighter cadence than the normal 15-min default - see
+// InpOpenPositionRefreshSeconds) pulls both Tier-2's action and the
+// orchestrator's short-horizon micro-trend read, and if BOTH have turned
+// against the position's direction, that counts as one disagreement.
+// Requiring InpMLReversalConfirmations (default 2) consecutive disagreements
+// before closing - rather than acting on the first one - is deliberate: a
+// single noisy refresh shouldn't be enough to whipsaw out of a trade that's
+// still fundamentally fine.
+void ManageMLReversalExit()
+  {
+   if(!InpUseMLReversalExit || !InpUseOrchestrator) return;
+   long type;
+   if(!HasOpenPosition(type)) { mlReversalDisagreeCount = 0; return; }
+
+   bool tier2Against = (type == POSITION_TYPE_BUY  && db_tier2_action == "SELL") ||
+                       (type == POSITION_TYPE_SELL && db_tier2_action == "BUY");
+   bool microAgainst = (type == POSITION_TYPE_BUY  && db_micro_trend == "SELL" && db_micro_trend_strength >= InpMicroTrendMinStrength) ||
+                       (type == POSITION_TYPE_SELL && db_micro_trend == "BUY"  && db_micro_trend_strength >= InpMicroTrendMinStrength);
+
+   if(tier2Against && microAgainst)
+     {
+      mlReversalDisagreeCount++;
+      PrintFormat("ML REVERSAL WARNING: Tier2=%s MicroTrend=%s (strength %.2f) against open %s position. Confirmation %d/%d.",
+                  db_tier2_action, db_micro_trend, db_micro_trend_strength,
+                  (type == POSITION_TYPE_BUY ? "BUY" : "SELL"), mlReversalDisagreeCount, InpMLReversalConfirmations);
+
+      if(mlReversalDisagreeCount >= InpMLReversalConfirmations)
+        {
+         Print("ML REVERSAL EXIT: model AND micro-trend both confirmed against this position across multiple refreshes. Closing.");
+         trade.PositionClose(_Symbol);
+         mlReversalDisagreeCount = 0;
+        }
+     }
+   else
+     {
+      mlReversalDisagreeCount = 0;   // any agreement/neutral reading resets - require persistence, not one-off noise
+     }
   }
 
 double GetEffectiveRiskPercent()
