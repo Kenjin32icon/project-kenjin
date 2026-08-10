@@ -211,7 +211,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="PROJECT KENJIN - Quant Matrix Orchestrator",
     description="High-frequency EA telemetry, indicator snapshot ingestion, and multi-tier strategy parameter sync API.",
-    version="11.1.0",
+    version="11.2.0",
     lifespan=lifespan,
 )
 
@@ -256,7 +256,28 @@ async def get_strategy_params(asset: str):
             asset,
         )
         if not row:
-            raise HTTPException(status_code=404, detail=f"Asset '{asset}' missing in strategy_db.")
+            # v11.2 FIX: previously a hard 404 here, which is what EURUSDw and
+            # BCHUSD were hitting in the log - any asset the EA is attached to
+            # but that nobody has manually seeded a strategy_db row for was
+            # stuck running with no gatekeeper tuning and no Tier-2 signal at
+            # all (the EA falls back to its local defaults on a failed fetch,
+            # so it wasn't fully blocked, just running blind). Auto-bootstrap
+            # a conservative default row instead, so any newly-attached asset
+            # onboards itself and starts accumulating gatekeeper/calibration
+            # history immediately rather than requiring a manual DB insert.
+            logger.warning("strategy_db had no row for '%s' - auto-bootstrapping defaults.", asset)
+            row = await conn.fetchrow(
+                """
+                INSERT INTO strategy_db (asset, opt_threshold, opt_sl_mult, opt_tp_mult, rsi_buy_max, rsi_sell_min, live_approved, updated_at)
+                VALUES ($1, 0.60, 1.5, 3.0, 70.0, 30.0, false, NOW())
+                ON CONFLICT (asset) DO UPDATE SET asset = EXCLUDED.asset
+                RETURNING asset, opt_threshold, opt_sl_mult, opt_tp_mult,
+                          rsi_buy_max, rsi_sell_min, live_approved,
+                          scheduled_start_hour, scheduled_end_hour,
+                          calibration_score, calibration_n
+                """,
+                asset,
+            )
 
         forecast = await conn.fetchrow(
             "SELECT id, bullish_prob, bearish_prob FROM forecasts WHERE asset = $1 ORDER BY generated_at DESC LIMIT 1",
@@ -334,13 +355,20 @@ async def post_ticks(payload: TickIn, background_tasks: BackgroundTasks):
     summary="Log Trade Execution Telemetry",
 )
 async def post_telemetry(payload: TelemetryIn):
+    # v11.2 BUG FIX: this INSERT previously referenced a column named "ts" on
+    # trade_telemetry, which does not exist on that table (it only exists on
+    # tick_telemetry - this was a copy/paste from insert_tick_row()). Every
+    # trade close was failing with asyncpg.exceptions.UndefinedColumnError
+    # and returning 500 to the EA, silently discarding every close: the
+    # gatekeeper's sample size could never grow, so live_approved was stuck
+    # at False forever regardless of how many trades actually closed.
     pool = get_pool()
     try:
         async with pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO trade_telemetry
-                (asset, type, price, lots, profit, rsi, entry_score, sl_price, tp_price, magic_number, account_type, session_hour, forecast_id, tier2_confidence, ts)
+                (asset, type, price, lots, profit, rsi, entry_score, sl_price, tp_price, magic_number, account_type, session_hour, forecast_id, tier2_confidence, created_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
                 """,
                 payload.asset, payload.type, payload.price, payload.lots, payload.profit,
