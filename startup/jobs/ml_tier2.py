@@ -11,7 +11,7 @@ even though the Redis cache was being populated on every single tick).
 
 This version computes the same engineered features, using the same formulas
 as feature_pull.py's Postgres path, so /strategy_params can now use Redis
-(sub-millisecond ZRANGEBYSCORE) as the primary hot path with Postgres kept
+(sub-millisecond ZRANGE) as the primary hot path with Postgres kept
 only as a cold-start/fallback. See orchestrator/main.py's get_strategy_params().
 """
 import os
@@ -41,8 +41,9 @@ async def pull_feature_window(symbol: str, window_minutes: int = 15) -> pd.DataF
     current_time = time.time()
     start_time = current_time - (window_minutes * 60)
 
-    # ZRANGEBYSCORE is O(log(N)+M) - this is the whole point of the Redis cache.
-    raw_ticks = await redis_client.zrangebyscore(redis_key, start_time, current_time)
+    # ZRANGE is O(log(N)+M) - this is the whole point of the Redis cache.
+    # Updated to use `zrange` with `byscore=True` for redis-py 5.0+ compatibility
+    raw_ticks = await redis_client.zrange(redis_key, start_time, current_time, byscore=True)
 
     if not raw_ticks:
         return pd.DataFrame()
