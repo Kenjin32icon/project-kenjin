@@ -2,7 +2,7 @@
 Pydantic API contract schema for v11 orchestrator integration.
 These are the API contract between the MQL5 EA and this
 service - field names here must match exactly what the EA's PostTick(),
-PostTelemetry(), and FetchStrategyParams() send/expect.
+PostTelemetry(), and FetchStrategyParams() send/expect[cite: 16].
 """
 from typing import Optional
 from pydantic import BaseModel, Field
@@ -39,7 +39,7 @@ class TelemetryIn(BaseModel):
     account_type: Optional[str] = None  # 'demo' or 'live'
     session_hour: Optional[int] = None
     forecast_id: Optional[int] = None
-    tier2_confidence: Optional[float] = None  # v11.1: now actually sent by the EA - see PostTelemetry()
+    tier2_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)  # v11.1: sent by EA
 
     class Config:
         populate_by_name = True
@@ -47,28 +47,30 @@ class TelemetryIn(BaseModel):
 
 class StrategyParamsOut(BaseModel):
     asset: str
-    opt_threshold: float
-    opt_sl_mult: float
-    opt_tp_mult: float
-    rsi_buy_max: float = 70.0    # Dynamic upper RSI ceiling
-    rsi_sell_min: float = 30.0   # Dynamic lower RSI floor
+    opt_threshold: float = Field(..., description="EV threshold required to trigger execution")[cite: 16]
+    opt_sl_mult: float = Field(..., description="Dynamic Stop Loss multiplier based on rolling win rate")[cite: 16]
+    opt_tp_mult: float = Field(..., description="Dynamic Take Profit multiplier based on rolling win rate")[cite: 16]
+    rsi_buy_max: float = Field(70.0, description="Dynamic upper threshold for RSI buys")[cite: 16]
+    rsi_sell_min: float = Field(30.0, description="Dynamic lower threshold for RSI sells")[cite: 16]
     live_approved: bool
     forecast_id: Optional[int] = None
     bullish_prob: Optional[float] = None
     bearish_prob: Optional[float] = None
     tier2_action: str = "HOLD"  # BUY, SELL, or HOLD
-    tier2_confidence: float = 0.0
+    tier2_confidence: float = Field(0.0, ge=0.0, le=1.0)
     recommended_lot_multiplier: float = 1.0
-    # v11.3: short-horizon (~1-2min) statistical trend, independent of
-    # tier2_action - see ml_tier2.py::compute_micro_trend(). Used by the EA
-    # to re-check an already-open position, not just at entry.
-    micro_trend: str = "NEUTRAL"
-    micro_trend_strength: float = 0.0
-    # v11: predictive session scheduling, populated by hour_scheduler.py.
-    # None until an asset has enough trade history - EA falls back to its
-    # static session inputs in that case.
-    scheduled_start_hour: Optional[int] = None
-    scheduled_end_hour: Optional[int] = None
+    
+    # v11.3: short-horizon (~1-2min) statistical trend, independent of tier2_action
+    micro_trend: str = Field("NEUTRAL", description="Short-horizon 1-2 min direction: BULLISH, BEARISH, NEUTRAL")[cite: 16]
+    micro_trend_strength: float = Field(0.0, ge=0.0, le=1.0, description="Normalized velocity strength (0.0 to 1.0)")[cite: 16]
+    
+    # v11: predictive session scheduling, populated by hour_scheduler.py
+    scheduled_start_hour: Optional[int] = Field(None, ge=0, le=23, description="UTC start hour for allowed executions")[cite: 16]
+    scheduled_end_hour: Optional[int] = Field(None, ge=0, le=23, description="UTC end hour for allowed executions")[cite: 16]
+    
+    # Calibration metrics for risk adjustments
+    calibration_score: Optional[float] = Field(None, description="Brier calibration score over rolling 30 days")[cite: 16]
+    calibration_n: Optional[int] = None
 
 
 class HealthOut(BaseModel):
