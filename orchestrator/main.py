@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+import numpy as np
 import pandas as pd
 
 load_dotenv()
@@ -47,7 +48,7 @@ _VALID_MODEL_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*(/[a-z0-9]+(-[a-z0-9]
 MIN_REDIS_ROWS_FOR_HOT_PATH = 8
 
 # -----------------------------------------------------------------------------
-# Schema models for admin requests[cite: 16]
+# Schema models for admin requests
 # -----------------------------------------------------------------------------
 class KillSwitchRequest(BaseModel):
     kill_switch: bool
@@ -119,20 +120,41 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 async def fetch_recent_telemetry() -> pd.DataFrame:
-    """Helper function to fetch telemetry records joined with tick feature context."""
+    """Helper function to fetch telemetry records joined with raw tick feature context and compute engineered features."""
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT tt.profit, te.ma_spread_delta, te.price_velocity_1m, te.rsi, te.rvol
+            SELECT 
+                tt.profit, 
+                te.rsi, te.bid, te.ask, te.ma10, te.ma50, te.tick_volume, te.ts
             FROM trade_telemetry tt
             LEFT JOIN LATERAL (
-                SELECT * FROM tick_telemetry
+                SELECT rsi, bid, ask, ma10, ma50, tick_volume, ts
+                FROM tick_telemetry
                 WHERE asset = tt.asset AND ts <= tt.created_at
                 ORDER BY ts DESC LIMIT 1
             ) te ON true
             WHERE tt.created_at >= NOW() - INTERVAL '30 days'
         """)
-    return pd.DataFrame([dict(r) for r in rows])
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame([dict(r) for r in rows])
+
+    # Convert numeric fields to float
+    for col in ['profit', 'rsi', 'bid', 'ask', 'ma10', 'ma50', 'tick_volume']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+
+    # Compute engineered features required by train_neural_maps()
+    df['ma_spread'] = df['ma10'] - df['ma50']
+    df['ma_spread_delta'] = df['ma_spread'] - df['ma_spread'].shift(1).fillna(0.0)
+    df['price_velocity_1m'] = df['bid'].diff(1).fillna(0.0)
+
+    mean_vol = df['tick_volume'].rolling(window=30, min_periods=1).mean()
+    df['rvol'] = np.where(mean_vol > 0, df['tick_volume'] / mean_vol, 1.0)
+
+    return df
 
 
 async def get_hot_feature_window(asset: str, minutes: int = 30) -> pd.DataFrame:
@@ -514,7 +536,7 @@ async def get_kpis():
     }
 
 # -----------------------------------------------------------------------------
-# Control & Job Endpoints[cite: 16]
+# Control & Job Endpoints
 # -----------------------------------------------------------------------------
 
 @app.post("/control/kill_switch", dependencies=[Depends(verify_api_key)], tags=["Control"])
