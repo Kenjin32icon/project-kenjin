@@ -21,7 +21,7 @@ cd "$ROOT_DIR"
 export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
 echo "==> Project Root Directory: $ROOT_DIR"
 
-# Ensure orchestrator static directory exists for dashboard.html[cite: 19]
+# Ensure orchestrator static directory exists for dashboard.html
 mkdir -p "$ORCH_DIR/static"
 
 # -----------------------------------------------------------------------------
