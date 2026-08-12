@@ -9,30 +9,6 @@ startup/routes/ (health.py, strategy.py, ticks.py, telemetry.py) are NOT
 imported anywhere below and are dead code relative to what actually runs.
 Delete startup/routes/*.py from the repo, or at minimum stop editing them.
 Every route lives here, once.
-
-v11 CHANGES vs the previous version:
-  - get_strategy_params() now tries the Redis-backed feature window
-    (startup/jobs/ml_tier2.py::pull_feature_window - sub-millisecond
-    ZRANGEBYSCORE) FIRST, falling back to the Postgres-backed window
-    (startup/jobs/feature_pull.py::pull_feature_window) only when Redis
-    doesn't yet have enough ticks cached for this asset (cold start /
-    Redis flush / brand-new asset). Previously the Redis cache was being
-    populated on every single tick but nothing ever read from it - the
-    hot path was always hitting Postgres.
-  - cache_tick_to_redis() now stamps each cached tick with a unix-seconds
-    'ts' field, which ml_tier2.pull_feature_window() needs to compute
-    real elapsed-time-based features (price velocity, MA spread delta).
-  - POST /ticks no longer blocks the HTTP response on the Postgres INSERT.
-    Both the Postgres write and the Redis cache write are now background
-    tasks, and the endpoint acknowledges immediately. Trade-off: a tick
-    insert failure is now logged rather than surfaced to the EA as a
-    non-2xx response - acceptable for telemetry, but flagged explicitly
-    here because it's a real behavior change.
-  - get_strategy_params() now also selects and returns scheduled_start_hour
-    / scheduled_end_hour from strategy_db (schema already had these
-    columns; nothing wrote or read them before).
-  - New hour_scheduler job added to the scheduler (~12h cadence) to
-    actually populate those two columns.
 """
 import asyncio
 import json
@@ -45,6 +21,7 @@ from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import pandas as pd
 
@@ -65,8 +42,6 @@ scheduler = AsyncIOScheduler()
 
 _VALID_MODEL_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*(/[a-z0-9]+(-[a-z0-9]+)*)*$")
 
-# Below this many rows, the Redis window is treated as "cold" and we fall
-# back to the slower but more complete Postgres-backed window.
 MIN_REDIS_ROWS_FOR_HOT_PATH = 8
 
 
@@ -86,8 +61,6 @@ async def cache_tick_to_redis(asset: str, tick_data: dict):
     current_time = time.time()
     redis_key = f"ticks:{asset}"
 
-    # v11: stamp the tick with its own timestamp so ml_tier2.pull_feature_window
-    # can compute real elapsed-time features instead of assuming even spacing.
     tick_data = dict(tick_data)
     tick_data["ts"] = current_time
 
@@ -100,7 +73,6 @@ async def cache_tick_to_redis(asset: str, tick_data: dict):
 
 
 async def insert_tick_row(payload: TickIn):
-    """v11: moved off the request/response critical path - runs as a background task."""
     pool = get_pool()
     try:
         async with pool.acquire() as conn:
@@ -151,10 +123,6 @@ async def fetch_recent_telemetry() -> pd.DataFrame:
 
 
 async def get_hot_feature_window(asset: str, minutes: int = 30) -> pd.DataFrame:
-    """
-    v11: Redis-first feature window for the /strategy_params hot path, with a
-    Postgres fallback for cold starts (asset just added, Redis flushed, etc).
-    """
     try:
         df = await redis_pull_feature_window(asset, window_minutes=minutes)
         if len(df) >= MIN_REDIS_ROWS_FOR_HOT_PATH:
@@ -188,10 +156,7 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(run_forecast_cycle, "interval", minutes=15, id="run_forecast_cycle")
         scheduler.add_job(run_gatekeeper_cycle, "interval", hours=1, id="run_gatekeeper_cycle")
         scheduler.add_job(run_retrain_cycle, "interval", hours=6, id="run_retrain_cycle")
-        # v11: populates strategy_db.scheduled_start_hour/end_hour
         scheduler.add_job(run_hour_scheduler_cycle, "interval", hours=12, id="run_hour_scheduler_cycle")
-        # v11.1: NEW - validates tier2_confidence against real outcomes, populates
-        # strategy_db.calibration_score/calibration_n
         scheduler.add_job(run_calibration_cycle, "interval", hours=24, id="run_calibration_cycle")
 
         scheduler.start()
@@ -216,23 +181,27 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# v11.4: serves the KPI dashboard (static/dashboard.html) at /static/dashboard.html.
-# The dashboard page itself is unauthenticated (it's just static HTML/JS), but every
-# data call it makes is to /kpis, which stays behind the same X-API-Key dependency as
-# every other data endpoint - the page prompts for the key client-side and holds it in
-# the browser's localStorage, it's never baked into this file.
-app.mount("/static", StaticFiles(directory="static", check_dir=False), name="static")
+# 1. Enable CORS for Electron desktop app and web preflight (OPTIONS /kpis)[cite: 18]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 2. Absolute Path for Static Directory[cite: 18]
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+os.makedirs(STATIC_DIR, exist_ok=True)
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR, check_dir=False), name="static")
 
 
 # --- ROUTES ---
 
 @app.get("/health", response_model=HealthOut, tags=["System Health"], summary="Service and Database Health Check")
 async def health():
-    """
-    Deliberately NOT behind API-key auth - the EA's OnInit() calls this to
-    decide whether to allow trading at all, and it must stay reachable
-    even if the key is misconfigured elsewhere.
-    """
     try:
         pool = get_pool()
         async with pool.acquire() as conn:
@@ -264,15 +233,6 @@ async def get_strategy_params(asset: str):
             asset,
         )
         if not row:
-            # v11.2 FIX: previously a hard 404 here, which is what EURUSDw and
-            # BCHUSD were hitting in the log - any asset the EA is attached to
-            # but that nobody has manually seeded a strategy_db row for was
-            # stuck running with no gatekeeper tuning and no Tier-2 signal at
-            # all (the EA falls back to its local defaults on a failed fetch,
-            # so it wasn't fully blocked, just running blind). Auto-bootstrap
-            # a conservative default row instead, so any newly-attached asset
-            # onboards itself and starts accumulating gatekeeper/calibration
-            # history immediately rather than requiring a manual DB insert.
             logger.warning("strategy_db had no row for '%s' - auto-bootstrapping defaults.", asset)
             row = await conn.fetchrow(
                 """
@@ -296,11 +256,6 @@ async def get_strategy_params(asset: str):
     bearish_prob = float(forecast["bearish_prob"]) if forecast and forecast["bearish_prob"] is not None else 50.0
     opt_threshold = float(row["opt_threshold"]) if row["opt_threshold"] is not None else 0.60
 
-    # v11.1: derive a calibration multiplier from confidence_calibration.py's output.
-    # Not enough validated history yet -> derate meaningfully (0.6x). Enough history
-    # but the model's stated confidence hasn't tracked real outcomes well (Brier
-    # score worse than an uninformative 0.5 guess) -> derate moderately (0.75x).
-    # Otherwise leave lot sizing exactly as Tier-2 computed it (1.0x).
     calibration_n = row["calibration_n"]
     calibration_score = row["calibration_score"]
     if calibration_n is None or int(calibration_n) < 30:
@@ -351,9 +306,6 @@ async def get_strategy_params(asset: str):
     summary="Ingest Bar/Tick Feature Snapshot",
 )
 async def post_ticks(payload: TickIn, background_tasks: BackgroundTasks):
-    # v11: both the Postgres write and the Redis cache write are now background
-    # tasks - the EA's PostTick() gets acknowledged immediately instead of
-    # waiting on a database round-trip on its entry-decision critical path.
     background_tasks.add_task(insert_tick_row, payload)
     background_tasks.add_task(cache_tick_to_redis, payload.asset, payload.model_dump())
     return {"status": "accepted", "asset": payload.asset}
@@ -367,13 +319,6 @@ async def post_ticks(payload: TickIn, background_tasks: BackgroundTasks):
     summary="Log Trade Execution Telemetry",
 )
 async def post_telemetry(payload: TelemetryIn):
-    # v11.2 BUG FIX: this INSERT previously referenced a column named "ts" on
-    # trade_telemetry, which does not exist on that table (it only exists on
-    # tick_telemetry - this was a copy/paste from insert_tick_row()). Every
-    # trade close was failing with asyncpg.exceptions.UndefinedColumnError
-    # and returning 500 to the EA, silently discarding every close: the
-    # gatekeeper's sample size could never grow, so live_approved was stuck
-    # at False forever regardless of how many trades actually closed.
     pool = get_pool()
     try:
         async with pool.acquire() as conn:
@@ -402,7 +347,6 @@ async def post_telemetry(payload: TelemetryIn):
     summary="Trigger Async Model Retraining Cycle",
 )
 async def trigger_retrain(background_tasks: BackgroundTasks):
-    """Manual or Webhook trigger to run model retraining asynchronously."""
     telemetry_df = await fetch_recent_telemetry()
 
     if telemetry_df.empty or len(telemetry_df) < 50:
@@ -420,7 +364,6 @@ async def trigger_retrain(background_tasks: BackgroundTasks):
     summary="Manually Trigger the Predictive Session Scheduler",
 )
 async def trigger_hour_scheduler(background_tasks: BackgroundTasks):
-    """Manual trigger - useful right after deploying v11 rather than waiting up to 12h."""
     from startup.jobs.hour_scheduler import run_hour_scheduler_cycle
     background_tasks.add_task(run_hour_scheduler_cycle)
     return {"status": "hour_scheduler_triggered"}
@@ -434,9 +377,7 @@ async def trigger_hour_scheduler(background_tasks: BackgroundTasks):
 )
 async def get_kpis():
     """
-    v11.4: single endpoint powering static/dashboard.html. Deliberately does
-    all the aggregation server-side in SQL rather than shipping raw rows to
-    the browser - keeps the dashboard a thin, dependency-light client.
+    v11.4: single endpoint powering static/dashboard.html with CORS support and absolute static pathing[cite: 18].
     """
     pool = get_pool()
     async with pool.acquire() as conn:
