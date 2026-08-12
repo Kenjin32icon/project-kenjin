@@ -1,5 +1,6 @@
 import asyncio
 import logging
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 
 # Load DATABASE_URL and other configuration from .env
