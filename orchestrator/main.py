@@ -181,7 +181,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# 1. Enable CORS for Electron desktop app and web preflight (OPTIONS /kpis)[cite: 18]
+# 1. Enable CORS for Electron desktop app and web preflight (OPTIONS /kpis)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -190,7 +190,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Absolute Path for Static Directory[cite: 18]
+# 2. Absolute Path for Static Directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
@@ -377,7 +377,7 @@ async def trigger_hour_scheduler(background_tasks: BackgroundTasks):
 )
 async def get_kpis():
     """
-    v11.4: single endpoint powering static/dashboard.html with CORS support and absolute static pathing[cite: 18].
+    v11.4: single endpoint powering static/dashboard.html with CORS support and absolute static pathing.
     """
     pool = get_pool()
     async with pool.acquire() as conn:
