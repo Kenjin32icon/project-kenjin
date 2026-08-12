@@ -157,7 +157,7 @@
 <div class="panel" style="margin-top: 20px;">
   <div class="panel-header"><h2>System Console Stream</h2></div>
   <div class="console-panel" id="consoleStream">
-    <div class="console-line info"><span class="ts">[System Initalized]</span> Monitoring console ready. Connecting to backend...</div>
+    <div class="console-line info"><span class="ts">[System Initialized]</span> Monitoring console ready. Connecting to backend...</div>
   </div>
 </div>
 
@@ -289,25 +289,115 @@ function render(data) {
   `).join('');
 }
 
+// =========================================================================
+// Administrative Command & Control API Functions[cite: 15]
+// =========================================================================
+
 async function triggerKillSwitch() {
     if (!confirm("EMERGENCY KILL SWITCH: Are you sure you want to pause ALL trading and reject new execution signals?")) return;
-    logConsole("CRITICAL: Global Emergency Kill Switch executed by operator.", "err");
-    // Implementation: POST /control/kill_switch
+    
+    const baseUrl = getCleanBaseUrl();
+    const apiKey = document.getElementById("apiKey").value.trim();
+    
+    logConsole("CRITICAL: Executing Global Emergency Kill Switch...", "err");
+
+    try {
+        const response = await fetch(`${baseUrl}/control/kill_switch`, {
+            method: "POST",
+            headers: {
+                "X-API-Key": apiKey,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ kill_switch: true, reason: "Operator manual override from admin dashboard" })
+        });
+
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+
+        const data = await response.json();
+        logConsole(`KILL SWITCH ACTIVATED: ${data.message || 'All asset executions suspended.'}`, "err");
+        fetchKpis(); // Refresh dashboard states immediately
+    } catch (error) {
+        logConsole(`Kill Switch Execution Failed: ${error.message}`, "err");
+    }
 }
 
 async function triggerModelRetrain() {
-    logConsole("Triggering LightGBM Triple Neural Map retrain background job...", "warn");
-    // Implementation: POST /jobs/retrain
+    const baseUrl = getCleanBaseUrl();
+    const apiKey = document.getElementById("apiKey").value.trim();
+
+    logConsole("Requesting LightGBM Triple Neural Map retrain background job...", "warn");
+
+    try {
+        const response = await fetch(`${baseUrl}/jobs/retrain`, {
+            method: "POST",
+            headers: {
+                "X-API-Key": apiKey,
+                "Content-Type": "application/json"
+            }
+        });
+
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+
+        const data = await response.json();
+        logConsole(`RETRAIN SUCCESS: ${data.message || 'LightGBM model retraining initiated.'}`, "info");
+    } catch (error) {
+        logConsole(`Model Retrain Failed: ${error.message}`, "err");
+    }
 }
 
 async function triggerCalibrate() {
+    const baseUrl = getCleanBaseUrl();
+    const apiKey = document.getElementById("apiKey").value.trim();
+
     logConsole("Triggering Brier score confidence calibration task...", "info");
-    // Implementation: POST /jobs/calibrate
+
+    try {
+        const response = await fetch(`${baseUrl}/jobs/calibrate`, {
+            method: "POST",
+            headers: {
+                "X-API-Key": apiKey,
+                "Content-Type": "application/json"
+            }
+        });
+
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+
+        const data = await response.json();
+        logConsole(`CALIBRATION COMPLETE: ${data.message || 'Brier scores updated across strategy DB.'}`, "info");
+        fetchKpis(); // Refresh updated calibration metrics in table
+    } catch (error) {
+        logConsole(`Calibration Task Failed: ${error.message}`, "err");
+    }
 }
 
 async function toggleAssetLive(asset, newState) {
-    logConsole(`Updating live execution status for ${asset} to ${newState}`, 'warn');
-    // Implementation: PATCH /strategy_params
+    const baseUrl = getCleanBaseUrl();
+    const apiKey = document.getElementById("apiKey").value.trim();
+    const actionLabel = newState ? 'LIVE' : 'HOLD';
+
+    logConsole(`Updating live execution status for ${asset} to ${actionLabel}...`, 'warn');
+
+    try {
+        const response = await fetch(`${baseUrl}/strategy_params`, {
+            method: "PATCH",
+            headers: {
+                "X-API-Key": apiKey,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                symbol: asset,
+                live_approved: newState
+            })
+        });
+
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+
+        const data = await response.json();
+        logConsole(`STATUS UPDATED: Asset ${asset} set to ${actionLabel}.`, "info");
+        fetchKpis(); // Refresh table state
+    } catch (error) {
+        logConsole(`Failed to update ${asset}: ${error.message}`, "err");
+    }
 }
 </script>
 </body>
