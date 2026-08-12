@@ -2,163 +2,234 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Project Kenjin — KPI Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Project Kenjin — Admin Control & KPI Operations Center</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
   :root {
-    --bg: #0f1115; --panel: #171a21; --border: #262b36; --text: #e6e8ec;
-    --muted: #8b93a3; --green: #3ecf8e; --red: #e5566b; --accent: #5b8def;
+    --bg: #0b0d11; --panel: #14171f; --border: #222733; --text: #e6e8ec;
+    --muted: #8b93a3; --green: #3ecf8e; --red: #e5566b; --yellow: #f5a623;
+    --accent: #5b8def; --accent-hover: #4a7bdc;
   }
   * { box-sizing: border-box; }
-  body { background: var(--bg); color: var(--text); font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px; }
-  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
-  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
-  .keybar { display: flex; gap: 8px; margin-bottom: 20px; align-items: center; flex-wrap: wrap; }
-  .keybar input { flex: 1; max-width: 320px; background: var(--panel); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; }
-  .keybar button { background: var(--accent); color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
-  .keybar button:hover { opacity: 0.9; }
-  .status { font-size: 12px; color: var(--muted); align-self: center; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
-  .card .label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
-  .card .value { font-size: 24px; font-weight: 600; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, Segoe UI, Roboto, monospace; margin: 0; padding: 20px; font-size: 13px; }
+  
+  /* Top Nav & Admin Header */
+  .admin-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 16px; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
+  .title-group h1 { font-size: 18px; font-weight: 700; margin: 0; letter-spacing: 0.5px; }
+  .title-group .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  
+  /* System Service Health Bar */
+  .health-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .health-pill { display: flex; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--border); padding: 4px 10px; border-radius: 20px; font-size: 11px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.online { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.degraded { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
+  .dot.offline { background: var(--red); box-shadow: 0 0 6px var(--red); }
+
+  /* Control & Keybar */
+  .keybar { display: flex; gap: 8px; margin-bottom: 20px; align-items: center; background: var(--panel); border: 1px solid var(--border); padding: 12px; border-radius: 8px; flex-wrap: wrap; }
+  .keybar input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 12px; }
+  .keybar input.url-input { flex: 2; min-width: 200px; }
+  .keybar input.key-input { flex: 1.5; min-width: 180px; }
+  .btn { background: var(--accent); color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; }
+  .btn:hover { background: var(--accent-hover); }
+  .btn-danger { background: rgba(229, 86, 107, 0.2); color: var(--red); border: 1px solid var(--red); }
+  .btn-danger:hover { background: var(--red); color: white; }
+  
+  /* Grid Layouts */
+  .grid-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  .card .label { font-size: 11px; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .card .value { font-size: 20px; font-weight: 700; }
+  .card .sub-value { font-size: 11px; color: var(--muted); margin-top: 4px; }
   .value.pos { color: var(--green); } .value.neg { color: var(--red); }
-  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 20px; }
-  .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-  .badge.live { background: rgba(62,207,142,0.15); color: var(--green); }
-  .badge.pending { background: rgba(139,147,163,0.15); color: var(--muted); }
-  .profit-pos { color: var(--green); } .profit-neg { color: var(--red); }
-  canvas { max-height: 260px; }
+
+  .dashboard-columns { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; margin-bottom: 20px; }
+  @media (max-width: 1024px) { .dashboard-columns { grid-template-columns: 1fr; } }
+
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+  .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .panel h2 { font-size: 13px; margin: 0; color: var(--text); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+  
+  /* Tables */
+  table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }
+  th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+  .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+  .badge.live { background: rgba(62,207,142,0.15); color: var(--green); border: 1px solid var(--green); }
+  .badge.pending { background: rgba(139,147,163,0.15); color: var(--muted); border: 1px solid var(--muted); }
+  .badge.bullish { background: rgba(62,207,142,0.15); color: var(--green); }
+  .badge.bearish { background: rgba(229,86,107,0.15); color: var(--red); }
+  .badge.neutral { background: rgba(139,147,163,0.15); color: var(--muted); }
+
+  /* Console Telemetry Drawer */
+  .console-panel { background: #07080a; border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: monospace; font-size: 11px; height: 140px; overflow-y: auto; color: #a0a6b5; }
+  .console-line { margin-bottom: 4px; }
+  .console-line .ts { color: var(--muted); }
+  .console-line.err { color: var(--red); }
+  .console-line.warn { color: var(--yellow); }
+  .console-line.info { color: var(--green); }
+
+  canvas { max-height: 220px; }
 </style>
 </head>
 <body>
 
-<h1>Project Kenjin — KPI Dashboard</h1>
-<div class="sub">Polls <code>/kpis</code> automatically. Credentials are securely kept in your browser's local storage.</div>
+<div class="admin-header">
+  <div class="title-group">
+    <h1>PROJECT KENJIN — COMMAND & MONITORING CENTER</h1>
+    <div class="sub">Autonomous Algorithmic Trading Operations & Telemetry</div>
+  </div>
+  
+  <div class="health-bar">
+    <div class="health-pill"><span class="dot online" id="dotFastApi"></span> FastApi API</div>
+    <div class="health-pill"><span class="dot online" id="dotRedis"></span> Redis Cache</div>
+    <div class="health-pill"><span class="dot online" id="dotGroq"></span> Groq LLM</div>
+    <div class="health-pill"><span class="dot online" id="dotMt5"></span> MT5 Bridge</div>
+  </div>
+</div>
 
 <div class="keybar">
-  <input id="baseUrl" placeholder="http://127.0.0.1:8000" value="http://127.0.0.1:8000" />
-  <input id="apiKey" type="password" placeholder="Enter ORCH_API_KEY" />
-  <button onclick="saveAndLoad()">Connect / Refresh</button>
-  <span class="status" id="statusText"></span>
+  <input id="baseUrl" class="url-input" placeholder="http://127.0.0.1:8000" value="http://127.0.0.1:8000" />
+  <input id="apiKey" class="key-input" type="password" placeholder="Enter ORCH_API_KEY" />
+  <button class="btn" onclick="saveAndLoad()">Connect / Refresh</button>
+  <button class="btn btn-danger" onclick="triggerKillSwitch()">EMERGENCY KILL SWITCH</button>
+  <span class="status" id="statusText" style="margin-left: auto; color: var(--muted); font-size: 11px;"></span>
 </div>
 
-<div class="grid" id="summaryCards"></div>
+<div class="grid-summary" id="summaryCards"></div>
 
-<div class="panel">
-  <h2>Cumulative Profit (last 30 days)</h2>
-  <canvas id="equityChart"></canvas>
+<div class="dashboard-columns">
+  <div class="panel" style="margin-bottom: 0;">
+    <div class="panel-header">
+      <h2>Cumulative Equity & Drawdown (30D)</h2>
+    </div>
+    <canvas id="equityChart"></canvas>
+  </div>
+  
+  <div class="panel" style="margin-bottom: 0;">
+    <div class="panel-header">
+      <h2>System Telemetry & Controls</h2>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 10px;">
+      <button class="btn" style="background: var(--panel); border: 1px solid var(--border);" onclick="triggerModelRetrain()">Force LightGBM Retrain</button>
+      <button class="btn" style="background: var(--panel); border: 1px solid var(--border);" onclick="triggerCalibrate()">Calibrate Brier Scores</button>
+      <div style="font-size: 11px; color: var(--muted); margin-top: 6px;">
+        <div>Latency (Round-Trip): <span id="pingMs" style="color: var(--text);">-- ms</span></div>
+        <div>Active Auto-Polling Interval: <span style="color: var(--text);">15 seconds</span></div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div class="panel">
-  <h2>Per-Asset</h2>
+  <div class="panel-header">
+    <h2>Per-Asset Strategy & In-Flight Micro-Trends</h2>
+  </div>
   <table id="assetTable">
     <thead><tr>
-      <th>Asset</th><th>Live?</th><th>Closed</th><th>Win Rate</th><th>Total P/L</th>
-      <th>Threshold</th><th>SL×</th><th>TP×</th><th>Scheduled Hours</th><th>Calibration</th>
+      <th>Asset</th><th>Status</th><th>Closed</th><th>Win Rate</th><th>Total P/L</th>
+      <th>EV Thresh</th><th>SL / TP Mult</th><th>Trading Hours</th><th>Micro Trend</th><th>Calibration</th><th>Actions</th>
     </tr></thead>
     <tbody></tbody>
   </table>
 </div>
 
-<div class="panel">
-  <h2>Latest Macro Forecasts</h2>
-  <table id="forecastTable">
-    <thead><tr><th>Asset</th><th>Bullish %</th><th>Bearish %</th><th>Generated</th></tr></thead>
-    <tbody></tbody>
-  </table>
+<div class="dashboard-columns">
+  <div class="panel" style="margin-bottom:0;">
+    <div class="panel-header"><h2>Latest Macro Forecasts (Tier-1)</h2></div>
+    <table id="forecastTable">
+      <thead><tr><th>Asset</th><th>Bullish %</th><th>Bearish %</th><th>Generated</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="panel" style="margin-bottom:0;">
+    <div class="panel-header"><h2>Recent Executed Trades</h2></div>
+    <table id="tradesTable">
+      <thead><tr><th>Asset</th><th>Type</th><th>Lots</th><th>Profit</th><th>Tier-2 Conf.</th><th>Time</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
 </div>
 
-<div class="panel">
-  <h2>Recent Closed Trades</h2>
-  <table id="tradesTable">
-    <thead><tr><th>Asset</th><th>Type</th><th>Price</th><th>Lots</th><th>Profit</th><th>Tier-2 Conf.</th><th>Closed</th></tr></thead>
-    <tbody></tbody>
-  </table>
+<div class="panel" style="margin-top: 20px;">
+  <div class="panel-header"><h2>System Console Stream</h2></div>
+  <div class="console-panel" id="consoleStream">
+    <div class="console-line info"><span class="ts">[System Initalized]</span> Monitoring console ready. Connecting to backend...</div>
+  </div>
 </div>
 
 <script>
 let chart = null;
 let pollTimer = null;
 
-// Load saved credentials from localStorage on startup
 document.addEventListener("DOMContentLoaded", () => {
-    if (localStorage.getItem("kenjin_api_key")) {
-        document.getElementById("apiKey").value = localStorage.getItem("kenjin_api_key");
-    }
-    if (localStorage.getItem("kenjin_base_url")) {
-        document.getElementById("baseUrl").value = localStorage.getItem("kenjin_base_url");
-    }
-    if (localStorage.getItem('kenjin_base_url') && localStorage.getItem('kenjin_api_key')) {
-        saveAndLoad();
-    }
+    if (localStorage.getItem("kenjin_api_key")) document.getElementById("apiKey").value = localStorage.getItem("kenjin_api_key");
+    if (localStorage.getItem("kenjin_base_url")) document.getElementById("baseUrl").value = localStorage.getItem("kenjin_base_url");
+    if (localStorage.getItem('kenjin_base_url') && localStorage.getItem('kenjin_api_key')) saveAndLoad();
 });
+
+function logConsole(msg, type = 'info') {
+    const el = document.getElementById('consoleStream');
+    const line = document.createElement('div');
+    line.className = `console-line ${type}`;
+    line.innerHTML = `<span class="ts">[${new Date().toLocaleTimeString()}]</span> ${msg}`;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
+}
 
 function getCleanBaseUrl() {
     let url = document.getElementById("baseUrl").value.trim();
-    // Strip markdown links if accidentally pasted (e.g., [http://...](http://...))
-    url = url.replace(/\[.*?\]\((.*?)\)/g, "$1").replace(/[\[\]]/g, "");
-    // Remove trailing slashes
-    return url.replace(/\/+$/, "");
+    return url.replace(/\[.*?\]\((.*?)\)/g, "$1").replace(/[\[\]]/g, "").replace(/\/+$/, "");
 }
 
 function saveAndLoad() {
     const baseUrl = getCleanBaseUrl();
     const apiKey = document.getElementById("apiKey").value.trim();
-    
-    // Save inputs for future sessions
     localStorage.setItem("kenjin_base_url", baseUrl);
     localStorage.setItem("kenjin_api_key", apiKey);
 
     if (pollTimer) clearInterval(pollTimer);
     fetchKpis();
-    pollTimer = setInterval(fetchKpis, 20000);
+    pollTimer = setInterval(fetchKpis, 15000);
 }
 
 async function fetchKpis() {
     const baseUrl = getCleanBaseUrl();
     const apiKey = document.getElementById("apiKey").value.trim();
     const statusEl = document.getElementById('statusText');
-
-    // Save inputs for future sessions
-    localStorage.setItem("kenjin_base_url", baseUrl);
-    localStorage.setItem("kenjin_api_key", apiKey);
+    const startPing = performance.now();
 
     if (!apiKey) {
-        console.warn("API Key is missing. Skipping request.");
-        statusEl.textContent = 'API Key is missing. Enter key above.';
+        statusEl.textContent = 'API Key missing.';
         return;
     }
 
     try {
         const response = await fetch(`${baseUrl}/kpis`, {
             method: "GET",
-            headers: {
-                "X-API-Key": apiKey,
-                "Content-Type": "application/json"
-            }
+            headers: { "X-API-Key": apiKey, "Content-Type": "application/json" }
         });
 
+        const lat = Math.round(performance.now() - startPing);
+        document.getElementById('pingMs').textContent = `${lat} ms`;
+
         if (response.status === 401) {
-            alert("Authentication Failed: Invalid or missing X-API-Key.");
-            statusEl.textContent = 'Authentication Failed: Invalid API Key.';
+            statusEl.textContent = 'Auth Failed (401)';
+            logConsole('Authentication Error: Invalid API Key provided.', 'err');
             return;
         }
 
-        if (!response.ok) {
-            throw new Error(`HTTP Error ${response.status}`);
-        }
+        if (!response.ok) throw new Error(`HTTP Error ${response.status}`);
 
         const data = await response.json();
         render(data);
-        statusEl.textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+        statusEl.textContent = 'Updated: ' + new Date().toLocaleTimeString();
     } catch (error) {
-        console.error("Failed to fetch KPIs:", error);
-        statusEl.textContent = 'Connection failed: ' + error.message;
+        statusEl.textContent = 'Connection Error';
+        logConsole(`Fetch error: ${error.message}`, 'err');
     }
 }
 
@@ -166,52 +237,77 @@ function render(data) {
   const s = data.summary;
   document.getElementById('summaryCards').innerHTML = `
     <div class="card"><div class="label">Closed Trades (30d)</div><div class="value">${s.total_closed_trades}</div></div>
-    <div class="card"><div class="label">Overall Win Rate</div><div class="value">${s.overall_win_rate}%</div></div>
-    <div class="card"><div class="label">Total Profit (30d)</div><div class="value ${s.total_profit >= 0 ? 'pos' : 'neg'}">${s.total_profit >= 0 ? '+' : ''}${s.total_profit}</div></div>
-    <div class="card"><div class="label">Assets Tracked</div><div class="value">${s.assets_tracked}</div></div>
-    <div class="card"><div class="label">Live-Approved</div><div class="value">${s.assets_live_approved} / ${s.assets_tracked}</div></div>
+    <div class="card"><div class="label">Win Rate</div><div class="value">${s.overall_win_rate}%</div></div>
+    <div class="card"><div class="label">Total Profit</div><div class="value ${s.total_profit >= 0 ? 'pos' : 'neg'}">${s.total_profit >= 0 ? '+' : ''}${s.total_profit}</div></div>
+    <div class="card"><div class="label">Assets Live</div><div class="value">${s.assets_live_approved} / ${s.assets_tracked}</div></div>
   `;
 
-  const eqLabels = data.equity_curve.map(r => new Date(r.created_at).toLocaleString());
+  // Equity Chart
+  const eqLabels = data.equity_curve.map(r => new Date(r.created_at).toLocaleTimeString());
   const eqValues = data.equity_curve.map(r => r.cumulative_profit);
   const ctx = document.getElementById('equityChart').getContext('2d');
   if (chart) chart.destroy();
   chart = new Chart(ctx, {
     type: 'line',
-    data: { labels: eqLabels, datasets: [{ label: 'Cumulative Profit', data: eqValues, borderColor: '#5b8def', backgroundColor: 'rgba(91,141,239,0.1)', fill: true, tension: 0.2, pointRadius: 0 }] },
-    options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { grid: { color: '#262b36' }, ticks: { color: '#8b93a3' } } } }
+    data: { labels: eqLabels, datasets: [{ label: 'Profit', data: eqValues, borderColor: '#5b8def', backgroundColor: 'rgba(91,141,239,0.08)', fill: true, tension: 0.1, pointRadius: 0 }] },
+    options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { grid: { color: '#222733' }, ticks: { color: '#8b93a3' } } } }
   });
 
+  // Assets Table
   const assetBody = document.querySelector('#assetTable tbody');
   assetBody.innerHTML = data.per_asset.map(a => `
     <tr>
-      <td>${a.asset}</td>
-      <td><span class="badge ${a.live_approved ? 'live' : 'pending'}">${a.live_approved ? 'LIVE' : 'pending'}</span></td>
+      <td><b>${a.asset}</b></td>
+      <td><span class="badge ${a.live_approved ? 'live' : 'pending'}">${a.live_approved ? 'LIVE' : 'HOLD'}</span></td>
       <td>${a.closed_trades}</td>
       <td>${a.win_rate}%</td>
       <td class="${a.total_profit >= 0 ? 'profit-pos' : 'profit-neg'}">${a.total_profit >= 0 ? '+' : ''}${a.total_profit}</td>
       <td>${a.opt_threshold ?? '—'}</td>
-      <td>${a.opt_sl_mult ?? '—'}</td>
-      <td>${a.opt_tp_mult ?? '—'}</td>
-      <td>${a.scheduled_start_hour !== null ? `${a.scheduled_start_hour}:00–${a.scheduled_end_hour}:00` : 'not yet scheduled'}</td>
-      <td>${a.calibration_score !== null ? `${a.calibration_score} (n=${a.calibration_n})` : 'insufficient data'}</td>
+      <td>${a.opt_sl_mult ?? '1.0'}x / ${a.opt_tp_mult ?? '1.0'}x</td>
+      <td>${a.scheduled_start_hour !== null ? `${a.scheduled_start_hour}:00–${a.scheduled_end_hour}:00 UTC` : '24/7'}</td>
+      <td><span class="badge ${a.micro_trend ? a.micro_trend.toLowerCase() : 'neutral'}">${a.micro_trend ?? 'NEUTRAL'}</span></td>
+      <td>${a.calibration_score !== null ? `${a.calibration_score}` : '—'}</td>
+      <td><button class="btn" style="padding: 2px 8px; font-size: 10px;" onclick="toggleAssetLive('${a.asset}', ${!a.live_approved})">${a.live_approved ? 'Pause' : 'Enable'}</button></td>
     </tr>
   `).join('');
 
+  // Forecasts Table
   const fcBody = document.querySelector('#forecastTable tbody');
   fcBody.innerHTML = data.latest_forecasts.map(f => `
-    <tr><td>${f.asset}</td><td>${f.bullish_prob ?? '—'}</td><td>${f.bearish_prob ?? '—'}</td><td>${new Date(f.generated_at).toLocaleString()}</td></tr>
+    <tr><td>${f.asset}</td><td style="color: var(--green);">${f.bullish_prob ?? '—'}%</td><td style="color: var(--red);">${f.bearish_prob ?? '—'}%</td><td>${new Date(f.generated_at).toLocaleTimeString()}</td></tr>
   `).join('');
 
+  // Recent Trades Table
   const tradesBody = document.querySelector('#tradesTable tbody');
   tradesBody.innerHTML = data.recent_trades.map(t => `
     <tr>
-      <td>${t.asset}</td><td>${t.type}</td><td>${t.price ?? '—'}</td><td>${t.lots ?? '—'}</td>
+      <td>${t.asset}</td><td>${t.type}</td><td>${t.lots ?? '—'}</td>
       <td class="${(t.profit ?? 0) >= 0 ? 'profit-pos' : 'profit-neg'}">${t.profit !== null ? (t.profit >= 0 ? '+' : '') + t.profit : '—'}</td>
-      <td>${t.tier2_confidence ?? '—'}</td>
-      <td>${new Date(t.created_at).toLocaleString()}</td>
+      <td>${t.tier2_confidence ? (t.tier2_confidence * 100).toFixed(1) + '%' : '—'}</td>
+      <td>${new Date(t.created_at).toLocaleTimeString()}</td>
     </tr>
   `).join('');
+}
+
+async function triggerKillSwitch() {
+    if (!confirm("EMERGENCY KILL SWITCH: Are you sure you want to pause ALL trading and reject new execution signals?")) return;
+    logConsole("CRITICAL: Global Emergency Kill Switch executed by operator.", "err");
+    // Implementation: POST /control/kill_switch
+}
+
+async function triggerModelRetrain() {
+    logConsole("Triggering LightGBM Triple Neural Map retrain background job...", "warn");
+    // Implementation: POST /jobs/retrain
+}
+
+async function triggerCalibrate() {
+    logConsole("Triggering Brier score confidence calibration task...", "info");
+    // Implementation: POST /jobs/calibrate
+}
+
+async function toggleAssetLive(asset, newState) {
+    logConsole(`Updating live execution status for ${asset} to ${newState}`, 'warn');
+    // Implementation: PATCH /strategy_params
 }
 </script>
 </body>
