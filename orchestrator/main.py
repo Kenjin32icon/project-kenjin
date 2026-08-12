@@ -57,7 +57,7 @@ def validate_groq_model() -> str:
 
 
 async def cache_tick_to_redis(asset: str, tick_data: dict):
-    """Saves tick to Redis ZSET and trims data older than 45 minutes[cite: 18]."""
+    """Saves tick to Redis ZSET and trims data older than 45 minutes."""
     current_time = time.time()
     redis_key = f"ticks:{asset}"
 
@@ -91,7 +91,7 @@ async def insert_tick_row(payload: TickIn):
 
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculates Average True Range for reward normalization[cite: 18]."""
+    """Calculates Average True Range for reward normalization."""
     if 'high' not in df.columns or 'low' not in df.columns or 'close' not in df.columns:
         return pd.Series(1e-5, index=df.index)
 
@@ -106,7 +106,7 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 async def fetch_recent_telemetry() -> pd.DataFrame:
-    """Helper function to fetch telemetry records joined with tick feature context[cite: 18]."""
+    """Helper function to fetch telemetry records joined with tick feature context."""
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
@@ -181,7 +181,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# 1. Enable CORS for Electron desktop app and web preflight (OPTIONS /kpis)[cite: 18]
+# 1. Enable CORS for Electron desktop app and web preflight (OPTIONS /kpis)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -190,7 +190,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Absolute Path for Static Directory[cite: 18]
+# 2. Absolute Path for Static Directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
@@ -222,7 +222,7 @@ async def health():
 async def get_strategy_params(asset: str):
     """
     Fetches strategy configuration, evaluates real-time Redis feature windows,
-    computes micro-trends, and returns parameters to MQL5[cite: 18].
+    computes micro-trends, and returns parameters to MQL5.
     """
     pool = get_pool()
     async with pool.acquire() as conn:
@@ -381,7 +381,7 @@ async def trigger_hour_scheduler(background_tasks: BackgroundTasks):
 )
 async def get_kpis():
     """
-    v11.4: single endpoint powering static/dashboard.html with CORS support and absolute static pathing[cite: 18].
+    v11.4: single endpoint powering static/dashboard.html with CORS support and absolute static pathing.
     """
     pool = get_pool()
     async with pool.acquire() as conn:
