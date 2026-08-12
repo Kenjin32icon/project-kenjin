@@ -17,11 +17,13 @@ import os
 import re
 import time
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Header, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from dotenv import load_dotenv
 import pandas as pd
 
@@ -43,6 +45,17 @@ scheduler = AsyncIOScheduler()
 _VALID_MODEL_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*(/[a-z0-9]+(-[a-z0-9]+)*)*$")
 
 MIN_REDIS_ROWS_FOR_HOT_PATH = 8
+
+# -----------------------------------------------------------------------------
+# Schema models for admin requests[cite: 16]
+# -----------------------------------------------------------------------------
+class KillSwitchRequest(BaseModel):
+    kill_switch: bool
+    reason: Optional[str] = "Manual operator override"
+
+class StrategyPatchRequest(BaseModel):
+    symbol: str
+    live_approved: bool
 
 
 def validate_groq_model() -> str:
@@ -498,4 +511,71 @@ async def get_kpis():
             }
             for r in latest_forecasts
         ],
+    }
+
+# -----------------------------------------------------------------------------
+# Control & Job Endpoints[cite: 16]
+# -----------------------------------------------------------------------------
+
+@app.post("/control/kill_switch", dependencies=[Depends(verify_api_key)], tags=["Control"])
+async def emergency_kill_switch(payload: KillSwitchRequest):
+    """
+    Emergency Halt: Deactivates live approval across all symbol strategies in Redis & Postgres.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE strategy_db SET live_approved = FALSE")
+        
+    return {
+        "status": "success", 
+        "message": f"Global Emergency Kill Switch executed. Reason: {payload.reason}"
+    }
+
+@app.post("/jobs/retrain", dependencies=[Depends(verify_api_key)], tags=["Control"])
+async def trigger_model_retrain(background_tasks: BackgroundTasks):
+    """
+    Triggers LightGBM background retraining.
+    """
+    telemetry_df = await fetch_recent_telemetry()
+
+    if telemetry_df.empty or len(telemetry_df) < 50:
+        raise HTTPException(status_code=400, detail="Insufficient telemetry data found to retrain (< 50 records).")
+
+    background_tasks.add_task(asyncio.to_thread, train_neural_maps, telemetry_df)
+    
+    return {
+        "status": "queued", 
+        "message": "LightGBM Triple Neural Map retraining initiated in background."
+    }
+
+@app.post("/jobs/calibrate", dependencies=[Depends(verify_api_key)], tags=["Control"])
+async def trigger_confidence_calibration(background_tasks: BackgroundTasks):
+    """
+    Calculates Brier calibration scores over 30-day telemetry.
+    """
+    from startup.jobs.confidence_calibration import run_calibration_cycle
+    background_tasks.add_task(run_calibration_cycle)
+    
+    return {
+        "status": "success", 
+        "message": "Brier score confidence calibration calculated and updated."
+    }
+
+@app.patch("/strategy_params", dependencies=[Depends(verify_api_key)], tags=["Control"])
+async def patch_strategy_params(payload: StrategyPatchRequest):
+    """
+    Updates live_approved flag for an individual trading pair.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE strategy_db SET live_approved = $1 WHERE asset = $2", 
+            payload.live_approved, payload.symbol
+        )
+        
+    return {
+        "status": "success", 
+        "symbol": payload.symbol, 
+        "live_approved": payload.live_approved,
+        "message": f"Asset {payload.symbol} live execution updated to {payload.live_approved}."
     }
