@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|                                 MAPSAR_ProfitEngine_v11_03.mq5       |
+//|                                 MAPSAR_ProfitEngine_v11_04.mq5       |
 //|        Universal Multi-Asset & Micro/Macro Equity Profit Engine   |
 //|  TEMA + AC + SAR + RSI Veto + Volume + MA(10/20/50/100/200)+ADX   |
 //|  Local Orchestrator (FastAPI) Integration with Tier-2 ML Signals  |
@@ -31,7 +31,13 @@
 //|     falling back to the static session inputs otherwise             |
 //+------------------------------------------------------------------+
 #property copyright "InfoScience"
-#property version   "11.03"
+#property version   "11.04"
+// v11.04: EA state (peakEquity, consecutive win/loss streaks, risk cooldown,
+// daily P/L, per-position profit-peak arming) now persists across EA
+// detach/reattach and terminal restarts via MT5 GlobalVariables - see the
+// "v11.4 STATE PERSISTENCE" block. Also now broadcasts its live score/Tier-2/
+// micro-trend view via the same channel for the new companion indicator,
+// MAPSAR_TrendVisualizer.mq5, to read and plot.
 // v11.03: NEW ManageMLReversalExit() - re-checks an OPEN position against
 // Tier-2's current action + a new short-horizon micro-trend signal on a
 // tightened refresh cadence (InpOpenPositionRefreshSeconds, default 60s vs
@@ -474,6 +480,127 @@ double ComputeTodaysRealizedPL()
    return(sum);
   }
 
+//+------------------------------------------------------------------+
+//| v11.4 STATE PERSISTENCE                                          |
+//| MT5's terminal-level GlobalVariables (GlobalVariableSet/Get) are  |
+//| stored by the terminal itself in a .gvs file on disk and survive  |
+//| the EA being removed/reattached, chart closed, or the whole       |
+//| terminal restarting - this is what "remembers past learning even  |
+//| if the system is closed and opened later" means on the EA side.   |
+//| They're prefixed by Magic Number + Symbol because GlobalVariables |
+//| are shared terminal-wide across every EA/script running, not      |
+//| private to one chart. Two caveats worth knowing: (1) they're      |
+//| local to this terminal installation, not synced anywhere, so a    |
+//| fresh terminal install starts blank; (2) MT5 can prune unused      |
+//| global variables after a long period of inactivity (documented    |
+//| terminal behavior, not something this EA controls) - for anything |
+//| that must survive indefinitely regardless of terminal activity,   |
+//| that's what strategy_db/trade_telemetry on the orchestrator side  |
+//| are for, which is why the Python-side models/DB were left exactly |
+//| as they already were (joblib .pkl files + Postgres already        |
+//| persist correctly, they just needed confirming, not rebuilding).  |
+//+------------------------------------------------------------------+
+string EAStatePrefix() { return(StringFormat("MAPSAR_%d_%s_", (int)InpMagicNumber, _Symbol)); }
+
+void SaveEAState()
+  {
+   string p = EAStatePrefix();
+   GlobalVariableSet(p + "peakEquity", peakEquity);
+   GlobalVariableSet(p + "consecutiveLosses", (double)consecutiveLosses);
+   GlobalVariableSet(p + "consecutiveWins", (double)consecutiveWins);
+   GlobalVariableSet(p + "riskCooldownActive", riskCooldownActive ? 1.0 : 0.0);
+   GlobalVariableSet(p + "dayRealizedPL", dayRealizedPL);
+   GlobalVariableSet(p + "todaysDayStamp", (double)todaysDayStamp);
+  }
+
+// Returns true if a same-day snapshot was found and restored (caller should
+// skip its normal fresh-day initialization in that case).
+bool LoadEAState()
+  {
+   string p = EAStatePrefix();
+   if(!GlobalVariableCheck(p + "todaysDayStamp")) return(false);   // never saved before - fresh start
+
+   datetime savedDayStamp = (datetime)GlobalVariableGet(p + "todaysDayStamp");
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   datetime todayStamp = StringToTime(StringFormat("%04d.%02d.%02d", dt.year, dt.mon, dt.day));
+
+   if(GlobalVariableCheck(p + "peakEquity"))
+      peakEquity = GlobalVariableGet(p + "peakEquity");
+   if(GlobalVariableCheck(p + "consecutiveLosses"))
+      consecutiveLosses = (int)GlobalVariableGet(p + "consecutiveLosses");
+   if(GlobalVariableCheck(p + "consecutiveWins"))
+      consecutiveWins = (int)GlobalVariableGet(p + "consecutiveWins");
+   if(GlobalVariableCheck(p + "riskCooldownActive"))
+      riskCooldownActive = (GlobalVariableGet(p + "riskCooldownActive") > 0.5);
+
+   if(savedDayStamp == todayStamp)
+     {
+      // Same calendar day as the last save - resume the day's running P/L too,
+      // so a restart mid-session doesn't quietly reset the daily-loss circuit breaker.
+      dayRealizedPL  = GlobalVariableCheck(p + "dayRealizedPL") ? GlobalVariableGet(p + "dayRealizedPL") : 0.0;
+      todaysDayStamp = savedDayStamp;
+      Print("EA STATE RESTORED: same-day resume - peakEquity=", peakEquity,
+            " consecutiveLosses=", consecutiveLosses, " dayRealizedPL=", dayRealizedPL);
+      return(true);
+     }
+
+   Print("EA STATE RESTORED (cross-day): peakEquity=", peakEquity,
+         " consecutiveLosses=", consecutiveLosses, " - day counters will reset fresh for today.");
+   return(false);   // different day - caller still needs to do the fresh-day day-boundary setup
+  }
+
+// Per-position profit-peak protection state (see ManageProfitPeakExit()) -
+// persisted per-ticket so an in-flight trade's "armed" status and its
+// floating-profit peak survive an EA restart instead of silently resetting.
+void SavePositionState(ulong ticket, bool armed, double peak)
+  {
+   string p = StringFormat("MAPSAR_pos_%d_", (int)ticket);
+   GlobalVariableSet(p + "armed", armed ? 1.0 : 0.0);
+   GlobalVariableSet(p + "peak", peak);
+  }
+
+void DeletePositionState(ulong ticket)
+  {
+   string p = StringFormat("MAPSAR_pos_%d_", (int)ticket);
+   GlobalVariableDel(p + "armed");
+   GlobalVariableDel(p + "peak");
+  }
+
+// Called once from OnInit(): re-adopts any position already open on this
+// symbol+magic (e.g. the EA was just reattached, or the terminal restarted
+// while a trade was live) into entryCtxArr, restoring its profit-peak state
+// from GlobalVariables if any was saved, and reading SL/TP straight off the
+// live position itself (those don't need persisting - MT5 already tracks them).
+void ReconcileOpenPositions()
+  {
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      if(FindEntryContextIndex(ticket) >= 0) continue;
+
+      EntryCtx e;
+      e.ticket = ticket;
+      e.rsi = 0.0; e.score = 0.0; e.forecastId = -1;
+      MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+      e.sessionHour = dt.hour;
+      e.slPrice = PositionGetDouble(POSITION_SL);
+      e.tpPrice = PositionGetDouble(POSITION_TP);
+      e.tier2Confidence = 0.0;
+
+      string p = StringFormat("MAPSAR_pos_%d_", (int)ticket);
+      e.armed      = GlobalVariableCheck(p + "armed") ? (GlobalVariableGet(p + "armed") > 0.5) : false;
+      e.peakProfit = GlobalVariableCheck(p + "peak")  ? GlobalVariableGet(p + "peak") : 0.0;
+
+      StoreEntryContext(e);
+      PrintFormat("RECONCILE: adopted pre-existing position #%d after (re)start - profit-peak armed=%s peak=%.2f (rsi/score/tier2Confidence reset to defaults, telemetry-only fields).",
+                  ticket, e.armed ? "true" : "false", e.peakProfit);
+     }
+  }
+
 int OnInit()
   {
    trade.SetExpertMagicNumber(InpMagicNumber);
@@ -511,15 +638,27 @@ int OnInit()
       lastParamsFetch = TimeCurrent();
      }
 
-   peakEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   // v11.4: restore whatever state survived from before this (re)start, before
+   // falling back to fresh-session defaults for anything that wasn't restorable.
+   bool resumedSameDay = LoadEAState();
+   ReconcileOpenPositions();
 
-   // v11: seed the day boundary + realized P/L ONCE via a full history scan;
-   // from here on it is maintained incrementally in OnTradeTransaction() so
-   // NewEntriesAllowed() never has to rescan the day's full deal history again.
-   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
-   todaysDayStamp = StringToTime(StringFormat("%04d.%02d.%02d", dt.year, dt.mon, dt.day));
-   dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-   dayRealizedPL  = ComputeTodaysRealizedPL();
+   if(peakEquity <= 0) peakEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   if(!resumedSameDay)
+     {
+      // v11: seed the day boundary + realized P/L ONCE via a full history scan;
+      // from here on it is maintained incrementally in OnTradeTransaction() so
+      // NewEntriesAllowed() never has to rescan the day's full deal history again.
+      MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+      todaysDayStamp = StringToTime(StringFormat("%04d.%02d.%02d", dt.year, dt.mon, dt.day));
+      dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      dayRealizedPL  = ComputeTodaysRealizedPL();
+     }
+   else
+     {
+      dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY) - dayRealizedPL;
+     }
 
    // v11: heartbeat so risk/exit management still runs during quiet tick periods,
    // which matters for keeping a reliable ~5-minute evaluation cadence.
@@ -657,12 +796,16 @@ void ManageProfitPeakExit()
         {
          entryCtxArr[idx].armed = true;
          entryCtxArr[idx].peakProfit = floatingProfit;
+         SavePositionState(ticket, true, floatingProfit);   // v11.4: persist immediately - this is the moment protection turns on
         }
       return;
      }
 
    if(floatingProfit > entryCtxArr[idx].peakProfit)
+     {
       entryCtxArr[idx].peakProfit = floatingProfit;
+      SavePositionState(ticket, true, floatingProfit);      // v11.4: persist the new peak as it grows
+     }
 
    double peak = entryCtxArr[idx].peakProfit;
    if(peak <= 0) return;
@@ -1119,6 +1262,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
    EntryCtx ctx;
    GetAndRemoveEntryContext(trans.position, ctx);
    PostTelemetry(NormalizeAssetKey(), typeStr, price, volume, profit, ctx);
+   DeletePositionState(trans.position);   // v11.4: this ticket is closed, stop carrying its profit-peak state forever
 
    // v11: maintain the running daily P/L incrementally instead of rescanning history.
    dayRealizedPL += profit;
@@ -1135,6 +1279,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
       if(riskCooldownActive && consecutiveWins >= InpWinsToRestoreRisk)
          riskCooldownActive = false;
      }
+
+   SaveEAState();   // v11.4: persist immediately after every close, not just on the heartbeat
   }
 
 // v11: NEW - runs on a fixed heartbeat (default every 30s) independent of ticks,
@@ -1153,6 +1299,8 @@ void OnTimer()
 
    ManageTrailing();
    RefreshParamsIfDue();
+
+   SaveEAState();   // v11.4: periodic persistence backstop, in addition to the event-driven saves
   }
 
 void OnTick()
@@ -1172,6 +1320,7 @@ void OnTick()
 
    SignalContext ctx;
    double score = ComputeSignalScore(ctx);
+   PublishLiveState(score);   // v11.4: broadcast for the companion chart indicator
 
    long type;
    if(HasOpenPosition(type))
@@ -1187,6 +1336,31 @@ void OnTick()
    // timeout, so a slow/unreachable orchestrator can never delay an entry.
    TryOpenTrade(score, ctx);
    PostTick(NormalizeAssetKey(), ctx);
+  }
+
+// v11.4: broadcasts the EA's current view via the same GlobalVariable channel
+// used for state persistence, so a SEPARATE program - specifically the new
+// companion indicator, MAPSAR_TrendVisualizer.mq5 - can read it and render a
+// live chart overlay without the EA and indicator needing any direct coupling.
+// MT5 indicators and Experts are separate running programs; GlobalVariables
+// are the standard, lightweight way for two programs on the same terminal to
+// share live state without files or sockets.
+void PublishLiveState(double localScore)
+  {
+   string p = EAStatePrefix();
+   GlobalVariableSet(p + "liveScore", localScore);
+
+   double tier2Code = 0.0;
+   if(db_tier2_action == "BUY") tier2Code = 1.0;
+   else if(db_tier2_action == "SELL") tier2Code = -1.0;
+   GlobalVariableSet(p + "liveTier2ActionCode", tier2Code);
+   GlobalVariableSet(p + "liveTier2Confidence", db_tier2_confidence);
+
+   double microCode = 0.0;
+   if(db_micro_trend == "BUY") microCode = 1.0;
+   else if(db_micro_trend == "SELL") microCode = -1.0;
+   GlobalVariableSet(p + "liveMicroTrendCode", microCode);
+   GlobalVariableSet(p + "liveMicroTrendStrength", db_micro_trend_strength);
   }
 
 double OnTester()
