@@ -8,3 +8,4 @@ startup/__pycache__
 startup/jobs/__pycache__
 reports
 db/__pycache__/redis_client.cpython-311.pyc
+electron-app/node_modules
