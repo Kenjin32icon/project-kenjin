@@ -1,18 +1,7 @@
 """
 Tier 2 Micro-Trigger Classifier: Rapid evaluation of tick features
 against Macro LLM bias using a LightGBM Triple 'Neural Map' Engine.
-Includes an in-memory caching mechanism and a heuristic fallback for cold starts.
-
-v11 change: pull_feature_window() below was previously dead code - it read
-raw ticks from Redis but returned them WITHOUT computing ma_spread_delta,
-price_velocity_1m, or rvol, so nothing in the codebase actually called it
-(main.py used the slower Postgres-backed version in feature_pull.py instead,
-even though the Redis cache was being populated on every single tick).
-
-This version computes the same engineered features, using the same formulas
-as feature_pull.py's Postgres path, so /strategy_params can now use Redis
-(sub-millisecond ZRANGE) as the primary hot path with Postgres kept
-only as a cold-start/fallback. See orchestrator/main.py's get_strategy_params().
+Includes an in-memory caching mechanism and a heuristic fallback for cold starts[cite: 17].
 """
 import os
 import time
@@ -21,28 +10,25 @@ import joblib
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+from typing import List, Dict, Tuple
 from db.redis_client import redis_client
 
-# Global cache for the models to prevent disk I/O bottlenecks
+# Global cache for the models to prevent disk I/O bottlenecks[cite: 17]
 _model_cache = {}
 
-# Columns cast to float for downstream math (mirrors feature_pull.py's Postgres path)
+# Columns cast to float for downstream math
 _RAW_FLOAT_COLS = ['bid', 'ask', 'tick_volume', 'rsi', 'tema', 'ac', 'sar', 'adx',
                     'ma10', 'ma20', 'ma50', 'ma100', 'ma200']
 
 
 async def pull_feature_window(symbol: str, window_minutes: int = 15) -> pd.DataFrame:
     """
-    Pulls the rolling tick window from Redis (fast path) and computes the same
-    engineered features the Postgres path computes, so callers get identical
-    columns regardless of which backend served the window.
+    Pulls the rolling tick window from Redis (fast path) and computes engineered features[cite: 17].
     """
     redis_key = f"ticks:{symbol}"
     current_time = time.time()
     start_time = current_time - (window_minutes * 60)
 
-    # ZRANGE is O(log(N)+M) - this is the whole point of the Redis cache.
-    # Updated to use `zrange` with `byscore=True` for redis-py 5.0+ compatibility
     raw_ticks = await redis_client.zrange(redis_key, start_time, current_time, byscore=True)
 
     if not raw_ticks:
@@ -59,13 +45,9 @@ async def pull_feature_window(symbol: str, window_minutes: int = 15) -> pd.DataF
         else:
             df[col] = 0.0
 
-    # v11: cache_tick_to_redis() in main.py now stamps each cached tick with a
-    # unix-seconds 'ts' field at write time, so we can reconstruct real elapsed
-    # time between ticks here instead of assuming even spacing.
     if 'ts' in df.columns:
         df['ts_dt'] = pd.to_datetime(df['ts'], unit='s')
     else:
-        # Cold-start safety: older cached ticks written before this field existed.
         df['ts_dt'] = pd.to_datetime(pd.Series(range(len(df))), unit='s')
     df = df.sort_values('ts_dt').reset_index(drop=True)
 
@@ -91,17 +73,7 @@ async def pull_feature_window(symbol: str, window_minutes: int = 15) -> pd.DataF
 
 def compute_micro_trend(df: pd.DataFrame) -> dict:
     """
-    v11.3: Short-horizon (~1-2 minute) statistical trend read, deliberately
-    independent of both the 15-minute Groq macro forecast and the LightGBM
-    Tier-2 models - pure arithmetic over the same feature window Tier-2
-    already has in memory, so it costs nothing extra to compute on every
-    /strategy_params call.
-
-    Purpose: give the EA something to check an ALREADY-OPEN position against
-    on a much tighter timeline than either of those two run on. Tier-2's
-    'action' answers "would I enter this trade right now" - it doesn't track
-    whether a trade already in flight is still going the right way on the
-    scale of the last minute or two. This does.
+    Short-horizon (~1-2 minute) statistical trend read independent of macro models[cite: 17].
     """
     if df.empty or len(df) < 5:
         return {"micro_trend": "NEUTRAL", "micro_trend_strength": 0.0}
@@ -121,8 +93,6 @@ def compute_micro_trend(df: pd.DataFrame) -> dict:
     elif ma_delta < 0:
         raw -= 0.4
 
-    # Thin/quiet tick activity makes a short-horizon read less trustworthy -
-    # dampen it rather than let a low-volume blip look like a strong signal.
     raw *= min(1.5, max(0.5, rvol))
 
     strength = min(1.0, abs(raw))
@@ -137,7 +107,7 @@ def compute_micro_trend(df: pd.DataFrame) -> dict:
 
 
 def get_models():
-    """Loads models into memory once and reuses them."""
+    """Loads models into memory once and reuses them[cite: 17]."""
     global _model_cache
     if not _model_cache:
         try:
@@ -150,13 +120,12 @@ def get_models():
 
 
 def train_neural_maps(telemetry_df: pd.DataFrame, risk_value: float = 1.0, opt_threshold: float = 0.1) -> bool:
-    """Trains the Triple Neural Map models on historical tick telemetry."""
+    """Trains the Triple Neural Map models on historical tick telemetry[cite: 17]."""
     global _model_cache
 
     if telemetry_df.empty or 'profit' not in telemetry_df.columns:
         return False
 
-    # 1. Prepare Target Variables
     telemetry_df['is_loss'] = (telemetry_df['profit'] < 0).astype(int)
     telemetry_df['is_profit'] = (telemetry_df['profit'] > 0).astype(int)
     telemetry_df['reward'] = telemetry_df['profit'].clip(lower=0)
@@ -170,17 +139,14 @@ def train_neural_maps(telemetry_df: pd.DataFrame, risk_value: float = 1.0, opt_t
 
     X = telemetry_df[features]
 
-    # 2. Train Map 1: P_loss (Classifier)
     y_loss = telemetry_df['is_loss']
     clf_loss = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05)
     clf_loss.fit(X, y_loss)
 
-    # 3. Train Map 2: P_profit (Classifier)
     y_profit = telemetry_df['is_profit']
     clf_profit = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05)
     clf_profit.fit(X, y_profit)
 
-    # 4. Train Map 3: E_reward (Regressor) - only on winning trades, to learn magnitude
     win_mask = telemetry_df['is_profit'] == 1
     if win_mask.sum() > 0:
         X_wins = X[win_mask]
@@ -191,7 +157,6 @@ def train_neural_maps(telemetry_df: pd.DataFrame, risk_value: float = 1.0, opt_t
         reg_reward = lgb.LGBMRegressor(n_estimators=10, learning_rate=0.05)
         reg_reward.fit(X, telemetry_df['reward'])
 
-    # 5. Save Models
     os.makedirs('models', exist_ok=True)
     joblib.dump(clf_loss, 'models/map_loss.pkl')
     joblib.dump(clf_profit, 'models/map_profit.pkl')
@@ -204,17 +169,7 @@ def train_neural_maps(telemetry_df: pd.DataFrame, risk_value: float = 1.0, opt_t
 def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: float, opt_threshold: float,
                            risk_value: float = 1.0, calibration_multiplier: float = 1.0) -> dict:
     """
-    Evaluates real-time ticks using the Triple Neural Map, falling back to heuristics if untrained.
-
-    calibration_multiplier (v11.1, new): supplied by main.py from
-    strategy_db.calibration_score/calibration_n, which confidence_calibration.py
-    computes from actual trade outcomes vs. the confidence recorded at entry
-    time. Defaults to 1.0 (no change) until an asset has enough validated
-    history - see confidence_calibration.py for the exact rule. This is what
-    makes "the model trusting itself more" evidence-gated rather than just a
-    number the model reports about itself: it can only size up toward the
-    2.5x ceiling once its own confidence has actually been checked against
-    what happened.
+    Evaluates real-time ticks using the Triple Neural Map, applying EV veto logic and calibration[cite: 17].
     """
     if df.empty or len(df) < 5:
         return {"action": "HOLD", "confidence": 0.0, "lot_multiplier": 1.0}
@@ -238,6 +193,7 @@ def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: f
 
         expected_value = (p_profit * e_reward) - (p_loss * risk_value)
 
+        # Tier-2 Veto: Block execution if loss probability exceeds 40% or EV is non-positive / below threshold[cite: 17]
         if p_loss > 0.40 or expected_value <= opt_threshold:
             action = "HOLD"
         else:
