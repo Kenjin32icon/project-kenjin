@@ -44,6 +44,7 @@ from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status
+from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 import pandas as pd
 
@@ -211,9 +212,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="PROJECT KENJIN - Quant Matrix Orchestrator",
     description="High-frequency EA telemetry, indicator snapshot ingestion, and multi-tier strategy parameter sync API.",
-    version="11.3.0",
+    version="11.4.0",
     lifespan=lifespan,
 )
+
+# v11.4: serves the KPI dashboard (static/dashboard.html) at /static/dashboard.html.
+# The dashboard page itself is unauthenticated (it's just static HTML/JS), but every
+# data call it makes is to /kpis, which stays behind the same X-API-Key dependency as
+# every other data endpoint - the page prompts for the key client-side and holds it in
+# the browser's localStorage, it's never baked into this file.
+app.mount("/static", StaticFiles(directory="static", check_dir=False), name="static")
 
 
 # --- ROUTES ---
@@ -416,3 +424,133 @@ async def trigger_hour_scheduler(background_tasks: BackgroundTasks):
     from startup.jobs.hour_scheduler import run_hour_scheduler_cycle
     background_tasks.add_task(run_hour_scheduler_cycle)
     return {"status": "hour_scheduler_triggered"}
+
+
+@app.get(
+    "/kpis",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Monitoring"],
+    summary="Aggregated KPIs for the Dashboard",
+)
+async def get_kpis():
+    """
+    v11.4: single endpoint powering static/dashboard.html. Deliberately does
+    all the aggregation server-side in SQL rather than shipping raw rows to
+    the browser - keeps the dashboard a thin, dependency-light client.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        per_asset = await conn.fetch(
+            """
+            SELECT
+                t.asset,
+                COUNT(*) FILTER (WHERE t.type LIKE '%CLOSE%') AS closed_trades,
+                COUNT(*) FILTER (WHERE t.type LIKE '%CLOSE%' AND t.profit > 0) AS wins,
+                COALESCE(SUM(t.profit) FILTER (WHERE t.type LIKE '%CLOSE%'), 0) AS total_profit,
+                s.live_approved,
+                s.opt_threshold,
+                s.opt_sl_mult,
+                s.opt_tp_mult,
+                s.scheduled_start_hour,
+                s.scheduled_end_hour,
+                s.calibration_score,
+                s.calibration_n
+            FROM trade_telemetry t
+            FULL OUTER JOIN strategy_db s ON s.asset = t.asset
+            WHERE t.created_at >= NOW() - INTERVAL '30 days' OR t.created_at IS NULL
+            GROUP BY t.asset, s.asset, s.live_approved, s.opt_threshold, s.opt_sl_mult,
+                     s.opt_tp_mult, s.scheduled_start_hour, s.scheduled_end_hour,
+                     s.calibration_score, s.calibration_n
+            ORDER BY COALESCE(t.asset, s.asset)
+            """
+        )
+
+        equity_curve = await conn.fetch(
+            """
+            SELECT created_at, profit,
+                   SUM(profit) OVER (ORDER BY created_at) AS cumulative_profit
+            FROM trade_telemetry
+            WHERE type LIKE '%CLOSE%' AND created_at >= NOW() - INTERVAL '30 days'
+            ORDER BY created_at ASC
+            """
+        )
+
+        recent_trades = await conn.fetch(
+            """
+            SELECT asset, type, price, lots, profit, tier2_confidence, created_at
+            FROM trade_telemetry
+            WHERE type LIKE '%CLOSE%'
+            ORDER BY created_at DESC
+            LIMIT 25
+            """
+        )
+
+        latest_forecasts = await conn.fetch(
+            """
+            SELECT DISTINCT ON (asset) asset, bullish_prob, bearish_prob, generated_at
+            FROM forecasts
+            ORDER BY asset, generated_at DESC
+            """
+        )
+
+    total_closed = sum(int(r["closed_trades"] or 0) for r in per_asset)
+    total_wins = sum(int(r["wins"] or 0) for r in per_asset)
+    total_profit = sum(float(r["total_profit"] or 0) for r in per_asset)
+
+    return {
+        "summary": {
+            "total_closed_trades": total_closed,
+            "total_wins": total_wins,
+            "overall_win_rate": round(100.0 * total_wins / total_closed, 1) if total_closed > 0 else 0.0,
+            "total_profit": round(total_profit, 2),
+            "assets_tracked": len(per_asset),
+            "assets_live_approved": sum(1 for r in per_asset if r["live_approved"]),
+        },
+        "per_asset": [
+            {
+                "asset": r["asset"],
+                "closed_trades": int(r["closed_trades"] or 0),
+                "wins": int(r["wins"] or 0),
+                "win_rate": round(100.0 * (r["wins"] or 0) / r["closed_trades"], 1) if (r["closed_trades"] or 0) > 0 else 0.0,
+                "total_profit": round(float(r["total_profit"] or 0), 2),
+                "live_approved": bool(r["live_approved"]) if r["live_approved"] is not None else False,
+                "opt_threshold": float(r["opt_threshold"]) if r["opt_threshold"] is not None else None,
+                "opt_sl_mult": float(r["opt_sl_mult"]) if r["opt_sl_mult"] is not None else None,
+                "opt_tp_mult": float(r["opt_tp_mult"]) if r["opt_tp_mult"] is not None else None,
+                "scheduled_start_hour": r["scheduled_start_hour"],
+                "scheduled_end_hour": r["scheduled_end_hour"],
+                "calibration_score": float(r["calibration_score"]) if r["calibration_score"] is not None else None,
+                "calibration_n": r["calibration_n"],
+            }
+            for r in per_asset if r["asset"] is not None
+        ],
+        "equity_curve": [
+            {
+                "created_at": r["created_at"].isoformat(),
+                "profit": float(r["profit"]),
+                "cumulative_profit": round(float(r["cumulative_profit"]), 2),
+            }
+            for r in equity_curve
+        ],
+        "recent_trades": [
+            {
+                "asset": r["asset"],
+                "type": r["type"],
+                "price": float(r["price"]) if r["price"] is not None else None,
+                "lots": float(r["lots"]) if r["lots"] is not None else None,
+                "profit": float(r["profit"]) if r["profit"] is not None else None,
+                "tier2_confidence": float(r["tier2_confidence"]) if r["tier2_confidence"] is not None else None,
+                "created_at": r["created_at"].isoformat(),
+            }
+            for r in recent_trades
+        ],
+        "latest_forecasts": [
+            {
+                "asset": r["asset"],
+                "bullish_prob": float(r["bullish_prob"]) if r["bullish_prob"] is not None else None,
+                "bearish_prob": float(r["bearish_prob"]) if r["bearish_prob"] is not None else None,
+                "generated_at": r["generated_at"].isoformat(),
+            }
+            for r in latest_forecasts
+        ],
+    }
