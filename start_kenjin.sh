@@ -1,121 +1,152 @@
 #!/usr/bin/env bash
 #
-# start_kenjin.sh — opens and runs Project Kenjin's orchestrator.
+# start_kenjin.sh — Complete launcher for Project Kenjin Orchestrator & FBS MT5.
 #
 # Usage:
 #   chmod +x start_kenjin.sh
 #   ./start_kenjin.sh
 #
-# What it does, in order:
-#   1. Confirms it's being run from (or can find) the orchestrator/ directory
-#   2. Starts redis-server if it isn't already running (best-effort, works
-#      with either a systemd-managed redis or a plain background process)
-#   3. Activates the Python venv (creates one on first run if missing)
-#   4. Confirms .env exists (refuses to start without it - better than
-#      starting with silently-missing config)
-#   5. Launches uvicorn in the foreground
-#   6. Opens the KPI dashboard in your default browser once the server is up
-#   7. On Ctrl+C, shuts down cleanly
-#
+
 set -euo pipefail
 
+# -----------------------------------------------------------------------------
+# 1. Directory Setup & Path Resolution
+# -----------------------------------------------------------------------------
+# Absolute root directory: /home/infoscience/Desktop/1. PROJECT KENJIN, SageEyes Predictive Quant Matrix/project-kenjin
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$SCRIPT_DIR"
+ORCH_DIR="$ROOT_DIR/orchestrator"
 
-# Allow running this script from the repo root OR from inside orchestrator/
-if [ -f "$SCRIPT_DIR/main.py" ]; then
-    ORCH_DIR="$SCRIPT_DIR"
-elif [ -f "$SCRIPT_DIR/orchestrator/main.py" ]; then
-    ORCH_DIR="$SCRIPT_DIR/orchestrator"
-else
-    echo "ERROR: couldn't find main.py in '$SCRIPT_DIR' or '$SCRIPT_DIR/orchestrator'."
-    echo "Place this script either next to main.py, or one level above the orchestrator/ folder."
-    exit 1
+cd "$ROOT_DIR"
+export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
+echo "==> Project Root Directory: $ROOT_DIR"
+
+# Ensure orchestrator static directory exists for dashboard.html[cite: 19]
+mkdir -p "$ORCH_DIR/static"
+
+# -----------------------------------------------------------------------------
+# 2. Process Cleanup (Close all past running instances)
+# -----------------------------------------------------------------------------
+echo "==> Terminating any previously running instances of Kenjin Orchestrator and MT5..."
+
+# Terminate past Uvicorn / FastAPI orchestrator processes & free port 8000
+pkill -f "uvicorn orchestrator.main:app" 2>/dev/null || true
+if command -v fuser >/dev/null 2>&1; then
+    fuser -k 8000/tcp 2>/dev/null || true
 fi
 
-cd "$ORCH_DIR"
-echo "==> Working directory: $ORCH_DIR"
+# Terminate past Wine / MetaTrader 5 instances
+pkill -f "terminal64.exe" 2>/dev/null || true
+pkill -f "FBS MT5" 2>/dev/null || true
+pkill -f "wine-stable" 2>/dev/null || true
 
-# --- 1. Redis ---------------------------------------------------------
+# Short wait to allow sockets and Wine processes to close down fully
+sleep 2
+echo "==> Cleanup complete."
+
+# -----------------------------------------------------------------------------
+# 3. Redis Service Check
+# -----------------------------------------------------------------------------
 if command -v redis-cli >/dev/null 2>&1 && redis-cli ping >/dev/null 2>&1; then
-    echo "==> Redis already running."
+    echo "==> Redis is running."
 elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet redis-server 2>/dev/null; then
-    echo "==> Redis already running (systemd)."
+    echo "==> Redis is running (systemd)."
 elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q redis-server; then
     echo "==> Starting Redis via systemd..."
     sudo systemctl start redis-server
 elif command -v redis-server >/dev/null 2>&1; then
-    echo "==> Starting Redis as a background process (no systemd unit found)..."
+    echo "==> Starting Redis as background daemon..."
     redis-server --daemonize yes
 else
-    echo "WARNING: redis-server not found on PATH. The Redis-fast-path in ml_tier2.py"
-    echo "         will fail and the orchestrator will fall back to the slower Postgres"
-    echo "         path automatically - not fatal, but install redis-server for full speed."
+    echo "WARNING: redis-server not found. Orchestrator will default to Postgres fallback."
 fi
 
-# --- 2. Python venv -----------------------------------------------------
-if [ ! -d ".venv" ]; then
-    echo "==> No .venv found - creating one and installing requirements (first run only)..."
-    python3 -m venv .venv
+# -----------------------------------------------------------------------------
+# 4. Virtual Environment Activation & Configuration Check
+# -----------------------------------------------------------------------------
+VENV_PATH="orchestrator/.venv"
+
+if [ ! -d "$VENV_PATH" ]; then
+    echo "==> Creating Python virtual environment at $VENV_PATH..."
+    python3 -m venv "$VENV_PATH"
     # shellcheck disable=SC1091
-    source .venv/bin/activate
+    source "$VENV_PATH/bin/activate"
     pip install --upgrade pip
-    pip install -r requirements.txt
+    if [ -f "orchestrator/requirements.txt" ]; then
+        pip install -r orchestrator/requirements.txt
+    fi
 else
     # shellcheck disable=SC1091
-    source .venv/bin/activate
+    source "$VENV_PATH/bin/activate"
 fi
-echo "==> Using Python: $(which python)"
 
-# --- 3. .env check -------------------------------------------------------
+echo "==> Using Python environment: $(which python)"
+
+# Check for root .env file
 if [ ! -f ".env" ]; then
-    echo "ERROR: .env not found in $ORCH_DIR."
-    echo "Create it with at least DATABASE_URL, ORCH_API_KEY, GROQ_API_KEY, REDIS_URL before running this script."
+    echo "ERROR: .env file missing in $ROOT_DIR!"
+    echo "Ensure DATABASE_URL, ORCH_API_KEY, GROQ_API_KEY, and REDIS_URL are configured in $ROOT_DIR/.env."
     exit 1
 fi
 
-# --- 4. Ensure static/ exists (for the KPI dashboard) --------------------
-mkdir -p static
-if [ ! -f "static/dashboard.html" ]; then
-    echo "NOTE: static/dashboard.html not found - the /static/dashboard.html KPI"
-    echo "      dashboard route will 404 until you place it there. The API itself"
-    echo "      will still start and run fine without it."
+# Check for dashboard frontend page
+if [ ! -f "$ORCH_DIR/static/dashboard.html" ]; then
+    echo "WARNING: Frontend dashboard not found at $ORCH_DIR/static/dashboard.html"
 fi
 
-# --- 5. Launch uvicorn, then open the dashboard once it's reachable ------
-HOST="${KENJIN_HOST:-127.0.0.1}"
-PORT="${KENJIN_PORT:-8000}"
+# -----------------------------------------------------------------------------
+# 5. Launch FBS MetaTrader 5 via Wine
+# -----------------------------------------------------------------------------
+echo "==> Launching FBS MetaTrader 5..."
+env WINEPREFIX="/home/infoscience/.wine" wine-stable "C:\users\infoscience\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\FBS MetaTrader 5\FBS MT5.lnk" > /dev/null 2>&1 &
+MT5_PID=$!
+echo "==> FBS MT5 launched (PID: $MT5_PID)."
 
-echo "==> Starting orchestrator on http://${HOST}:${PORT} ..."
+# -----------------------------------------------------------------------------
+# 6. Launch FastAPI Orchestrator & Open Dashboard
+# -----------------------------------------------------------------------------
+HOST="127.0.0.1"
+PORT="8000"
+
+echo "==> Starting Kenjin Orchestrator API (http://${HOST}:${PORT})..."
 uvicorn orchestrator.main:app --host 127.0.0.1 --port 8000 --env-file .env &
 UVICORN_PID=$!
 
 cleanup() {
     echo ""
-    echo "==> Shutting down orchestrator (pid $UVICORN_PID)..."
+    echo "==> Shutting down Kenjin Orchestrator (PID: $UVICORN_PID)..."
     kill "$UVICORN_PID" 2>/dev/null || true
     wait "$UVICORN_PID" 2>/dev/null || true
-    echo "==> Stopped."
+    echo "==> Stopped successfully."
 }
 trap cleanup INT TERM
 
-# Wait for /health to respond before trying to open the browser (max ~15s)
+# Poll /health endpoint until orchestrator is online (max 15 seconds)
+echo "==> Waiting for API health check..."
 for i in $(seq 1 30); do
     if curl -sf "http://${HOST}:${PORT}/health" >/dev/null 2>&1; then
+        echo "==> Orchestrator active and healthy."
         break
     fi
     sleep 0.5
 done
 
+# Open dashboard in standard default browser
 DASHBOARD_URL="http://${HOST}:${PORT}/static/dashboard.html"
+echo "==> Opening KPI Monitor: $DASHBOARD_URL"
+
 if command -v xdg-open >/dev/null 2>&1; then
     xdg-open "$DASHBOARD_URL" >/dev/null 2>&1 || true
 elif command -v open >/dev/null 2>&1; then
     open "$DASHBOARD_URL" >/dev/null 2>&1 || true
-else
-    echo "==> Open this in your browser: $DASHBOARD_URL"
 fi
 
-echo "==> Kenjin is running. Dashboard: $DASHBOARD_URL"
-echo "==> Press Ctrl+C to stop."
+echo "========================================================================="
+echo "  Project Kenjin is live!"
+echo "  - API Backend: http://${HOST}:${PORT}"
+echo "  - Dashboard:   $DASHBOARD_URL"
+echo "  - FBS MT5:     Running under Wine prefix /home/infoscience/.wine"
+echo "  Press Ctrl+C to stop the system."
+echo "========================================================================="
 
 wait "$UVICORN_PID"
