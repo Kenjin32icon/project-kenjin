@@ -1,0 +1,13 @@
+{
+  "name": "kenjin-kpi-dashboard",
+  "version": "1.0.0",
+  "description": "Project Kenjin Quant Matrix KPI Monitor",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "electron": "^28.0.0"
+  }
+}
