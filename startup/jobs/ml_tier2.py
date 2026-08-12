@@ -1,7 +1,7 @@
 """
 Tier 2 Micro-Trigger Classifier: Rapid evaluation of tick features
 against Macro LLM bias using a LightGBM Triple 'Neural Map' Engine.
-Includes an in-memory caching mechanism and a heuristic fallback for cold starts[cite: 17].
+Includes an in-memory caching mechanism and a heuristic fallback for cold starts.
 """
 import os
 import time
@@ -13,7 +13,7 @@ import lightgbm as lgb
 from typing import List, Dict, Tuple
 from db.redis_client import redis_client
 
-# Global cache for the models to prevent disk I/O bottlenecks[cite: 17]
+# Global cache for the models to prevent disk I/O bottlenecks
 _model_cache = {}
 
 # Columns cast to float for downstream math
@@ -23,7 +23,7 @@ _RAW_FLOAT_COLS = ['bid', 'ask', 'tick_volume', 'rsi', 'tema', 'ac', 'sar', 'adx
 
 async def pull_feature_window(symbol: str, window_minutes: int = 15) -> pd.DataFrame:
     """
-    Pulls the rolling tick window from Redis (fast path) and computes engineered features[cite: 17].
+    Pulls the rolling tick window from Redis (fast path) and computes engineered features.
     """
     redis_key = f"ticks:{symbol}"
     current_time = time.time()
@@ -73,7 +73,7 @@ async def pull_feature_window(symbol: str, window_minutes: int = 15) -> pd.DataF
 
 def compute_micro_trend(df: pd.DataFrame) -> dict:
     """
-    Short-horizon (~1-2 minute) statistical trend read independent of macro models[cite: 17].
+    Short-horizon (~1-2 minute) statistical trend read independent of macro models.
     """
     if df.empty or len(df) < 5:
         return {"micro_trend": "NEUTRAL", "micro_trend_strength": 0.0}
@@ -107,7 +107,7 @@ def compute_micro_trend(df: pd.DataFrame) -> dict:
 
 
 def get_models():
-    """Loads models into memory once and reuses them[cite: 17]."""
+    """Loads models into memory once and reuses them."""
     global _model_cache
     if not _model_cache:
         try:
@@ -120,7 +120,7 @@ def get_models():
 
 
 def train_neural_maps(telemetry_df: pd.DataFrame, risk_value: float = 1.0, opt_threshold: float = 0.1) -> bool:
-    """Trains the Triple Neural Map models on historical tick telemetry[cite: 17]."""
+    """Trains the Triple Neural Map models on historical tick telemetry."""
     global _model_cache
 
     if telemetry_df.empty or 'profit' not in telemetry_df.columns:
@@ -169,7 +169,7 @@ def train_neural_maps(telemetry_df: pd.DataFrame, risk_value: float = 1.0, opt_t
 def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: float, opt_threshold: float,
                            risk_value: float = 1.0, calibration_multiplier: float = 1.0) -> dict:
     """
-    Evaluates real-time ticks using the Triple Neural Map, applying EV veto logic and calibration[cite: 17].
+    Evaluates real-time ticks using the Triple Neural Map, applying EV veto logic and calibration.
     """
     if df.empty or len(df) < 5:
         return {"action": "HOLD", "confidence": 0.0, "lot_multiplier": 1.0}
@@ -193,7 +193,7 @@ def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: f
 
         expected_value = (p_profit * e_reward) - (p_loss * risk_value)
 
-        # Tier-2 Veto: Block execution if loss probability exceeds 40% or EV is non-positive / below threshold[cite: 17]
+        # Tier-2 Veto: Block execution if loss probability exceeds 40% or EV is non-positive / below threshold
         if p_loss > 0.40 or expected_value <= opt_threshold:
             action = "HOLD"
         else:
