@@ -150,3 +150,31 @@ function sendMockTick() {
 }
 
 ```
+
+## 🚀 How to Install and Run Project Kenjin (Windows Guide)
+
+If you have been invited to run a node of Project Kenjin on your Windows machine to help train the Machine Learning model, follow these step-by-step instructions. No coding experience is required!
+
+### Step 1: Create a GitHub Account & Download the Code
+1. Go to [GitHub.com](https://github.com/) and click **Sign Up** in the top right corner if you don't already have an account.
+2. Once logged in, visit the project repository: `https://github.com/Kenjin32icon/project-kenjin.git`.
+3. To download the code:
+   * **Option A (Easy):** Click the green **"<> Code"** button and select **"Download ZIP"**. Extract the ZIP file to a folder on your Desktop.
+   * **Option B (Advanced):** If you have Git installed, open your Command Prompt and run: `git clone https://github.com/Kenjin32icon/project-kenjin.git`
+
+### Step 2: Install Prerequisites
+Before running the system, your computer needs two standard tools:
+* **Python:** Go to [python.org/downloads](https://www.python.org/downloads/) and download the latest installer. **Crucial:** When running the installer, make sure to check the box at the bottom that says **"Add Python to PATH"** before clicking Install.
+* **Node.js:** Go to [nodejs.org](https://nodejs.org/) and download the "LTS" (Long Term Support) version. Run the installer with all the default settings.
+* **FBS MetaTrader 5:** Ensure you have the FBS MT5 terminal installed on your computer.
+
+### Step 3: Connect to the Shared Database
+To ensure your machine shares trading data with the main Machine Learning model, you need a configuration file:
+1. Open the `project-kenjin` folder you downloaded.
+2. Create a new text file and name it exactly `.env` (make sure Windows doesn't secretly name it `.env.txt`).
+3. Reach out to the project administrator to get the secure database credentials. Paste them into this file. It will look something like this:
+   ```text
+   DATABASE_URL=postgres://...
+   REDIS_URL=redis://...
+   ORCH_API_KEY=your_secret_api_key
+   GROQ_API_KEY=your_groq_key
