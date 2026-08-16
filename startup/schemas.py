@@ -76,3 +76,27 @@ class StrategyParamsOut(BaseModel):
 class HealthOut(BaseModel):
     status: str
     db: str
+
+class AccountSnapshotIn(BaseModel):
+    account_type: str                                  # 'demo' or 'live'
+    login: Optional[int] = None
+    asset: Optional[str] = None
+    balance: float
+    equity: float
+    margin: Optional[float] = None
+    margin_level: Optional[float] = None
+    floating_pl: Optional[float] = None
+    peak_equity: Optional[float] = None
+    drawdown_pct: Optional[float] = None
+    day_loss_pct: Optional[float] = None
+    consecutive_losses: Optional[int] = None
+    consecutive_wins: Optional[int] = None
+    risk_cooldown_active: Optional[bool] = None
+    drawdown_halt: Optional[bool] = None
+
+
+class RiskIncidentIn(BaseModel):
+    account_type: str
+    asset: Optional[str] = None
+    reason: str
+    details: Optional[str] = None
