@@ -105,3 +105,33 @@ CREATE TABLE public.missed_trade_analytics (
   created_at timestamp with time zone DEFAULT now(),
   CONSTRAINT missed_trade_analytics_pkey PRIMARY KEY (id)
 );
+CREATE TABLE public.account_snapshots (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account_type text NOT NULL,          -- 'demo' or 'live'
+  login bigint,
+  asset text,                          -- which EA instance/chart posted this
+  balance numeric,
+  equity numeric,
+  margin numeric,
+  margin_level numeric,
+  floating_pl numeric,
+  peak_equity numeric,
+  drawdown_pct numeric,
+  day_loss_pct numeric,
+  consecutive_losses integer,
+  consecutive_wins integer,
+  risk_cooldown_active boolean,
+  drawdown_halt boolean,
+  ts timestamp with time zone NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_account_snapshots_type_ts ON public.account_snapshots (account_type, ts DESC);
+
+CREATE TABLE public.risk_incidents (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account_type text NOT NULL,
+  asset text,
+  reason text NOT NULL,                -- 'daily_loss_limit' | 'drawdown_halt' | 'floating_loss_kill_switch' | 'max_consecutive_losses'
+  details text,
+  created_at timestamp with time zone NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_risk_incidents_created_at ON public.risk_incidents (created_at DESC);
