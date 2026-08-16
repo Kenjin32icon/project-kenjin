@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -32,7 +33,10 @@ load_dotenv()
 
 from db.redis_client import redis_client
 from startup.db import close_db_pool, get_pool, init_db_pool
-from startup.schemas import HealthOut, StrategyParamsOut, TelemetryIn, TickIn
+from startup.schemas import (
+    HealthOut, StrategyParamsOut, TelemetryIn, TickIn,
+    AccountSnapshotIn, RiskIncidentIn,
+)
 from startup.jobs.feature_pull import pull_feature_window as pg_pull_feature_window
 from startup.jobs.ml_tier2 import evaluate_tier2_signal, train_neural_maps, compute_micro_trend
 from startup.jobs.ml_tier2 import pull_feature_window as redis_pull_feature_window
@@ -377,6 +381,58 @@ async def post_telemetry(payload: TelemetryIn):
         raise HTTPException(status_code=500, detail="Failed to store telemetry.")
     return {"status": "logged", "asset": payload.asset}
 
+@app.post(
+    "/account_snapshot",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(verify_api_key)],
+    tags=["Telemetry"],
+    summary="Ingest Live Account Balance/Equity Snapshot",
+)
+async def post_account_snapshot(payload: AccountSnapshotIn):
+    pool = get_pool()
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO account_snapshots
+                (account_type, login, asset, balance, equity, margin, margin_level, floating_pl,
+                 peak_equity, drawdown_pct, day_loss_pct, consecutive_losses, consecutive_wins,
+                 risk_cooldown_active, drawdown_halt, ts)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15, NOW())
+                """,
+                payload.account_type, payload.login, payload.asset, payload.balance, payload.equity,
+                payload.margin, payload.margin_level, payload.floating_pl, payload.peak_equity,
+                payload.drawdown_pct, payload.day_loss_pct, payload.consecutive_losses,
+                payload.consecutive_wins, payload.risk_cooldown_active, payload.drawdown_halt,
+            )
+    except Exception:
+        logger.exception("Failed to insert account_snapshots row for %s", payload.account_type)
+        raise HTTPException(status_code=500, detail="Failed to store account snapshot.")
+    return {"status": "logged", "account_type": payload.account_type}
+
+
+@app.post(
+    "/risk_incident",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(verify_api_key)],
+    tags=["Control"],
+    summary="Log a Local EA Circuit-Breaker Trip",
+)
+async def post_risk_incident(payload: RiskIncidentIn):
+    pool = get_pool()
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO risk_incidents (account_type, asset, reason, details) VALUES ($1,$2,$3,$4)",
+                payload.account_type, payload.asset, payload.reason, payload.details,
+            )
+    except Exception:
+        logger.exception("Failed to insert risk_incidents row")
+        raise HTTPException(status_code=500, detail="Failed to store risk incident.")
+    logger.warning("RISK INCIDENT: %s | %s | %s | %s",
+                    payload.account_type, payload.asset, payload.reason, payload.details)
+    return {"status": "logged", "reason": payload.reason}
+
 
 @app.post(
     "/retrain",
@@ -473,6 +529,25 @@ async def get_kpis():
             """
         )
 
+        latest_accounts = await conn.fetch(
+            """
+            SELECT DISTINCT ON (account_type) account_type, login, asset, balance, equity, margin,
+                   margin_level, floating_pl, peak_equity, drawdown_pct, day_loss_pct,
+                   consecutive_losses, consecutive_wins, risk_cooldown_active, drawdown_halt, ts
+            FROM account_snapshots
+            ORDER BY account_type, ts DESC
+            """
+        )
+
+        recent_incidents = await conn.fetch(
+            """
+            SELECT account_type, asset, reason, details, created_at
+            FROM risk_incidents
+            ORDER BY created_at DESC
+            LIMIT 20
+            """
+        )
+
     total_closed = sum(int(r["closed_trades"] or 0) for r in per_asset)
     total_wins = sum(int(r["wins"] or 0) for r in per_asset)
     total_profit = sum(float(r["total_profit"] or 0) for r in per_asset)
@@ -532,6 +607,36 @@ async def get_kpis():
                 "generated_at": r["generated_at"].isoformat(),
             }
             for r in latest_forecasts
+        ],
+        "accounts": [
+            {
+                "account_type": r["account_type"],
+                "login": r["login"],
+                "asset": r["asset"],
+                "balance": float(r["balance"]) if r["balance"] is not None else None,
+                "equity": float(r["equity"]) if r["equity"] is not None else None,
+                "floating_pl": float(r["floating_pl"]) if r["floating_pl"] is not None else None,
+                "margin_level": float(r["margin_level"]) if r["margin_level"] is not None else None,
+                "peak_equity": float(r["peak_equity"]) if r["peak_equity"] is not None else None,
+                "drawdown_pct": float(r["drawdown_pct"]) if r["drawdown_pct"] is not None else None,
+                "day_loss_pct": float(r["day_loss_pct"]) if r["day_loss_pct"] is not None else None,
+                "consecutive_losses": r["consecutive_losses"],
+                "risk_cooldown_active": r["risk_cooldown_active"],
+                "drawdown_halt": r["drawdown_halt"],
+                "last_updated": r["ts"].isoformat(),
+                "seconds_since_update": (datetime.now(timezone.utc) - r["ts"]).total_seconds(),
+            }
+            for r in latest_accounts
+        ],
+        "risk_incidents": [
+            {
+                "account_type": r["account_type"],
+                "asset": r["asset"],
+                "reason": r["reason"],
+                "details": r["details"],
+                "created_at": r["created_at"].isoformat(),
+            }
+            for r in recent_incidents
         ],
     }
 
