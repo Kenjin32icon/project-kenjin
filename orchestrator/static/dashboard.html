@@ -36,7 +36,10 @@
   .btn:hover { background: var(--accent-hover); }
   .btn-danger { background: rgba(229, 86, 107, 0.2); color: var(--red); border: 1px solid var(--red); }
   .btn-danger:hover { background: var(--red); color: white; }
-  
+  .btn-outline { background: var(--panel); border: 1px solid var(--border); }
+  .btn-outline:hover { background: var(--border); }
+  .status-text { margin-left: auto; color: var(--muted); font-size: 11px; }
+
   /* Grid Layouts */
   .grid-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 20px; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
@@ -48,7 +51,8 @@
   .dashboard-columns { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; margin-bottom: 20px; }
   @media (max-width: 1024px) { .dashboard-columns { grid-template-columns: 1fr; } }
 
-  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .panel.no-margin { margin-bottom: 0; }
   .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
   .panel h2 { font-size: 13px; margin: 0; color: var(--text); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
   
@@ -62,9 +66,16 @@
   .badge.bullish { background: rgba(62,207,142,0.15); color: var(--green); }
   .badge.bearish { background: rgba(229,86,107,0.15); color: var(--red); }
   .badge.neutral { background: rgba(139,147,163,0.15); color: var(--muted); }
+  
+  /* Missing Classes Added */
+  .profit-pos { color: var(--green); font-weight: 600; }
+  .profit-neg { color: var(--red); font-weight: 600; }
+  
+  .controls-stack { display: flex; flex-direction: column; gap: 10px; }
 
   /* Console Telemetry Drawer */
   .console-panel { background: #07080a; border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: monospace; font-size: 11px; height: 140px; overflow-y: auto; color: #a0a6b5; }
+  .console-panel.short { height: 110px; }
   .console-line { margin-bottom: 4px; }
   .console-line .ts { color: var(--muted); }
   .console-line.err { color: var(--red); }
@@ -95,35 +106,49 @@
   <input id="apiKey" class="key-input" type="password" placeholder="Enter ORCH_API_KEY" />
   <button class="btn" onclick="saveAndLoad()">Connect / Refresh</button>
   <button class="btn btn-danger" onclick="triggerKillSwitch()">EMERGENCY KILL SWITCH</button>
-  <span class="status" id="statusText" style="margin-left: auto; color: var(--muted); font-size: 11px;"></span>
+  <span class="status-text" id="statusText"></span>
 </div>
 
 <div class="grid-summary" id="summaryCards"></div>
 
 <div class="dashboard-columns">
-  <div class="panel" style="margin-bottom: 0;">
+  <div class="panel no-margin">
     <div class="panel-header">
       <h2>Cumulative Equity & Drawdown (30D)</h2>
     </div>
     <canvas id="equityChart"></canvas>
   </div>
   
-  <div class="panel" style="margin-bottom: 0;">
+  <div class="panel no-margin">
     <div class="panel-header">
       <h2>System Telemetry & Controls</h2>
     </div>
-    <div style="display: flex; flex-direction: column; gap: 10px;">
-      <button class="btn" style="background: var(--panel); border: 1px solid var(--border);" onclick="triggerModelRetrain()">Force LightGBM Retrain</button>
-      <button class="btn" style="background: var(--panel); border: 1px solid var(--border);" onclick="triggerCalibrate()">Calibrate Brier Scores</button>
+    <div class="controls-stack">
+      <button class="btn btn-outline" onclick="triggerModelRetrain()">Force LightGBM Retrain</button>
+      <button class="btn btn-outline" onclick="triggerCalibrate()">Calibrate Brier Scores</button>
       <div style="font-size: 11px; color: var(--muted); margin-top: 6px;">
         <div>Latency (Round-Trip): <span id="pingMs" style="color: var(--text);">-- ms</span></div>
-        <div>Active Auto-Polling Interval: <span style="color: var(--text);">15 seconds</span></div>
+        <div>Active Auto-Polling Interval: <span style="color: var(--text);" id="pollIntervalLabel"></span></div>
       </div>
     </div>
   </div>
 </div>
 
-<div class="panel">
+<div class="dashboard-columns">
+  <div class="panel no-margin">
+    <div class="panel-header"><h2>Live Account State</h2></div>
+    <div class="grid-summary" id="accountCards" style="margin-bottom:0;"></div>
+  </div>
+
+  <div class="panel no-margin">
+    <div class="panel-header"><h2>Recent Risk Incidents</h2></div>
+    <div class="console-panel short" id="riskIncidentStream">
+      <div class="console-line info">No risk incidents recorded yet.</div>
+    </div>
+  </div>
+</div>
+
+<div class="panel" style="margin-bottom: 20px;">
   <div class="panel-header">
     <h2>Per-Asset Strategy & In-Flight Micro-Trends</h2>
   </div>
@@ -137,7 +162,7 @@
 </div>
 
 <div class="dashboard-columns">
-  <div class="panel" style="margin-bottom:0;">
+  <div class="panel no-margin">
     <div class="panel-header"><h2>Latest Macro Forecasts (Tier-1)</h2></div>
     <table id="forecastTable">
       <thead><tr><th>Asset</th><th>Bullish %</th><th>Bearish %</th><th>Generated</th></tr></thead>
@@ -145,7 +170,7 @@
     </table>
   </div>
 
-  <div class="panel" style="margin-bottom:0;">
+  <div class="panel no-margin">
     <div class="panel-header"><h2>Recent Executed Trades</h2></div>
     <table id="tradesTable">
       <thead><tr><th>Asset</th><th>Type</th><th>Lots</th><th>Profit</th><th>Tier-2 Conf.</th><th>Time</th></tr></thead>
@@ -162,10 +187,26 @@
 </div>
 
 <script>
+// --- Configuration ---
+const POLL_INTERVAL_MS = 15000;
+// ---------------------
+
 let chart = null;
 let pollTimer = null;
 
+// XSS Sanitization Utility Function
+function escapeHTML(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
 document.addEventListener("DOMContentLoaded", () => {
+    document.getElementById('pollIntervalLabel').textContent = `${POLL_INTERVAL_MS / 1000} seconds`;
     if (localStorage.getItem("kenjin_api_key")) document.getElementById("apiKey").value = localStorage.getItem("kenjin_api_key");
     if (localStorage.getItem("kenjin_base_url")) document.getElementById("baseUrl").value = localStorage.getItem("kenjin_base_url");
     if (localStorage.getItem('kenjin_base_url') && localStorage.getItem('kenjin_api_key')) saveAndLoad();
@@ -175,7 +216,8 @@ function logConsole(msg, type = 'info') {
     const el = document.getElementById('consoleStream');
     const line = document.createElement('div');
     line.className = `console-line ${type}`;
-    line.innerHTML = `<span class="ts">[${new Date().toLocaleTimeString()}]</span> ${msg}`;
+    // Sanitize the dynamic message while keeping the hardcoded span structure
+    line.innerHTML = `<span class="ts">[${new Date().toLocaleTimeString()}]</span> ${escapeHTML(msg)}`;
     el.appendChild(line);
     el.scrollTop = el.scrollHeight;
 }
@@ -193,7 +235,7 @@ function saveAndLoad() {
 
     if (pollTimer) clearInterval(pollTimer);
     fetchKpis();
-    pollTimer = setInterval(fetchKpis, 15000);
+    pollTimer = setInterval(fetchKpis, POLL_INTERVAL_MS);
 }
 
 async function fetchKpis() {
@@ -236,10 +278,10 @@ async function fetchKpis() {
 function render(data) {
   const s = data.summary;
   document.getElementById('summaryCards').innerHTML = `
-    <div class="card"><div class="label">Closed Trades (30d)</div><div class="value">${s.total_closed_trades}</div></div>
-    <div class="card"><div class="label">Win Rate</div><div class="value">${s.overall_win_rate}%</div></div>
-    <div class="card"><div class="label">Total Profit</div><div class="value ${s.total_profit >= 0 ? 'pos' : 'neg'}">${s.total_profit >= 0 ? '+' : ''}${s.total_profit}</div></div>
-    <div class="card"><div class="label">Assets Live</div><div class="value">${s.assets_live_approved} / ${s.assets_tracked}</div></div>
+    <div class="card"><div class="label">Closed Trades (30d)</div><div class="value">${Number(s.total_closed_trades)}</div></div>
+    <div class="card"><div class="label">Win Rate</div><div class="value">${Number(s.overall_win_rate)}%</div></div>
+    <div class="card"><div class="label">Total Profit</div><div class="value ${s.total_profit >= 0 ? 'pos' : 'neg'}">${s.total_profit >= 0 ? '+' : ''}${Number(s.total_profit)}</div></div>
+    <div class="card"><div class="label">Assets Live</div><div class="value">${Number(s.assets_live_approved)} / ${Number(s.assets_tracked)}</div></div>
   `;
 
   // Equity Chart
@@ -253,40 +295,88 @@ function render(data) {
     options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { grid: { color: '#222733' }, ticks: { color: '#8b93a3' } } } }
   });
 
+  // Live Account State
+  const acctEl = document.getElementById('accountCards');
+  if (data.accounts && data.accounts.length) {
+    acctEl.innerHTML = data.accounts.map(a => {
+      const stale = a.seconds_since_update > 120;
+      const safeAsset = escapeHTML(a.asset ?? 'n/a');
+      const safeAcctType = escapeHTML(a.account_type.toUpperCase());
+      const staleTag = stale ? `<div class="sub-value" style="color: var(--red);">STALE — no update in ${Math.round(a.seconds_since_update)}s</div>` : '';
+      const haltTag = a.drawdown_halt ? '<span class="badge bearish">DRAWDOWN HALT</span>' :
+                      (a.risk_cooldown_active ? '<span class="badge neutral">COOLDOWN</span>' : '<span class="badge live">NORMAL</span>');
+      return `
+        <div class="card">
+          <div class="label">${safeAcctType} — ${safeAsset}</div>
+          <div class="value ${a.equity >= a.balance ? 'pos' : 'neg'}">${a.equity != null ? a.equity.toFixed(2) : '—'}</div>
+          <div class="sub-value">Balance ${a.balance != null ? a.balance.toFixed(2) : '—'} · Floating ${a.floating_pl != null ? (a.floating_pl >= 0 ? '+' : '') + a.floating_pl.toFixed(2) : '—'}</div>
+          <div class="sub-value">Drawdown ${a.drawdown_pct != null ? a.drawdown_pct.toFixed(1) : '0.0'}% · Daily loss ${a.day_loss_pct != null ? a.day_loss_pct.toFixed(1) : '0.0'}%</div>
+          <div class="sub-value">${haltTag}</div>
+          ${staleTag}
+        </div>`;
+    }).join('');
+  } else {
+    acctEl.innerHTML = `<div class="card"><div class="label">Account State</div><div class="sub-value">No snapshots received yet — EA needs the v11.06 PostAccountSnapshot() patch.</div></div>`;
+  }
+
+  // Risk Incidents
+  const riskEl = document.getElementById('riskIncidentStream');
+  if (data.risk_incidents && data.risk_incidents.length) {
+    riskEl.innerHTML = data.risk_incidents.map(r => {
+        const safeReason = escapeHTML(r.reason);
+        const safeDetails = escapeHTML(r.details);
+        const safeAsset = escapeHTML(r.asset ?? '');
+        const safeAcctType = escapeHTML(r.account_type.toUpperCase());
+        return `
+      <div class="console-line ${safeReason.toLowerCase().includes('drawdown') || safeReason.toLowerCase().includes('loss') ? 'err' : 'warn'}">
+        <span class="ts">[${new Date(r.created_at).toLocaleString()}]</span>
+        ${safeAcctType} ${safeAsset} — <b>${safeReason}</b>${safeDetails ? ': ' + safeDetails : ''}
+      </div>`
+    }).join('');
+  }
+  
   // Assets Table
   const assetBody = document.querySelector('#assetTable tbody');
-  assetBody.innerHTML = data.per_asset.map(a => `
+  assetBody.innerHTML = data.per_asset.map(a => {
+    const safeAsset = escapeHTML(a.asset);
+    const safeMicroTrend = escapeHTML(a.micro_trend ?? 'NEUTRAL');
+    return `
     <tr>
-      <td><b>${a.asset}</b></td>
+      <td><b>${safeAsset}</b></td>
       <td><span class="badge ${a.live_approved ? 'live' : 'pending'}">${a.live_approved ? 'LIVE' : 'HOLD'}</span></td>
-      <td>${a.closed_trades}</td>
-      <td>${a.win_rate}%</td>
-      <td class="${a.total_profit >= 0 ? 'profit-pos' : 'profit-neg'}">${a.total_profit >= 0 ? '+' : ''}${a.total_profit}</td>
-      <td>${a.opt_threshold ?? '—'}</td>
-      <td>${a.opt_sl_mult ?? '1.0'}x / ${a.opt_tp_mult ?? '1.0'}x</td>
-      <td>${a.scheduled_start_hour !== null ? `${a.scheduled_start_hour}:00–${a.scheduled_end_hour}:00 UTC` : '24/7'}</td>
-      <td><span class="badge ${a.micro_trend ? a.micro_trend.toLowerCase() : 'neutral'}">${a.micro_trend ?? 'NEUTRAL'}</span></td>
-      <td>${a.calibration_score !== null ? `${a.calibration_score}` : '—'}</td>
-      <td><button class="btn" style="padding: 2px 8px; font-size: 10px;" onclick="toggleAssetLive('${a.asset}', ${!a.live_approved})">${a.live_approved ? 'Pause' : 'Enable'}</button></td>
+      <td>${Number(a.closed_trades)}</td>
+      <td>${Number(a.win_rate)}%</td>
+      <td class="${a.total_profit >= 0 ? 'profit-pos' : 'profit-neg'}">${a.total_profit >= 0 ? '+' : ''}${Number(a.total_profit)}</td>
+      <td>${a.opt_threshold !== null ? Number(a.opt_threshold) : '—'}</td>
+      <td>${a.opt_sl_mult !== null ? Number(a.opt_sl_mult) : '1.0'}x / ${a.opt_tp_mult !== null ? Number(a.opt_tp_mult) : '1.0'}x</td>
+      <td>${a.scheduled_start_hour !== null ? `${Number(a.scheduled_start_hour)}:00–${Number(a.scheduled_end_hour)}:00 UTC` : '24/7'}</td>
+      <td><span class="badge ${safeMicroTrend.toLowerCase()}">${safeMicroTrend}</span></td>
+      <td>${a.calibration_score !== null ? `${Number(a.calibration_score)}` : '—'}</td>
+      <td><button class="btn" style="padding: 2px 8px; font-size: 10px;" onclick="toggleAssetLive('${safeAsset}', ${!a.live_approved})">${a.live_approved ? 'Pause' : 'Enable'}</button></td>
     </tr>
-  `).join('');
+  `}).join('');
 
   // Forecasts Table
   const fcBody = document.querySelector('#forecastTable tbody');
-  fcBody.innerHTML = data.latest_forecasts.map(f => `
-    <tr><td>${f.asset}</td><td style="color: var(--green);">${f.bullish_prob ?? '—'}%</td><td style="color: var(--red);">${f.bearish_prob ?? '—'}%</td><td>${new Date(f.generated_at).toLocaleTimeString()}</td></tr>
-  `).join('');
+  fcBody.innerHTML = data.latest_forecasts.map(f => {
+    const safeAsset = escapeHTML(f.asset);
+    return `
+    <tr><td>${safeAsset}</td><td style="color: var(--green);">${f.bullish_prob ?? '—'}%</td><td style="color: var(--red);">${f.bearish_prob ?? '—'}%</td><td>${new Date(f.generated_at).toLocaleTimeString()}</td></tr>
+  `}).join('');
 
   // Recent Trades Table
   const tradesBody = document.querySelector('#tradesTable tbody');
-  tradesBody.innerHTML = data.recent_trades.map(t => `
+  tradesBody.innerHTML = data.recent_trades.map(t => {
+    const safeAsset = escapeHTML(t.asset);
+    const safeType = escapeHTML(t.type);
+    return `
     <tr>
-      <td>${t.asset}</td><td>${t.type}</td><td>${t.lots ?? '—'}</td>
+      <td>${safeAsset}</td><td>${safeType}</td><td>${t.lots ?? '—'}</td>
       <td class="${(t.profit ?? 0) >= 0 ? 'profit-pos' : 'profit-neg'}">${t.profit !== null ? (t.profit >= 0 ? '+' : '') + t.profit : '—'}</td>
       <td>${t.tier2_confidence ? (t.tier2_confidence * 100).toFixed(1) + '%' : '—'}</td>
       <td>${new Date(t.created_at).toLocaleTimeString()}</td>
     </tr>
-  `).join('');
+  `}).join('');
 }
 
 // =========================================================================
@@ -315,7 +405,7 @@ async function triggerKillSwitch() {
 
         const data = await response.json();
         logConsole(`KILL SWITCH ACTIVATED: ${data.message || 'All asset executions suspended.'}`, "err");
-        fetchKpis(); // Refresh dashboard states immediately
+        fetchKpis(); 
     } catch (error) {
         logConsole(`Kill Switch Execution Failed: ${error.message}`, "err");
     }
@@ -364,7 +454,7 @@ async function triggerCalibrate() {
 
         const data = await response.json();
         logConsole(`CALIBRATION COMPLETE: ${data.message || 'Brier scores updated across strategy DB.'}`, "info");
-        fetchKpis(); // Refresh updated calibration metrics in table
+        fetchKpis(); 
     } catch (error) {
         logConsole(`Calibration Task Failed: ${error.message}`, "err");
     }
@@ -392,9 +482,8 @@ async function toggleAssetLive(asset, newState) {
 
         if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
 
-        const data = await response.json();
         logConsole(`STATUS UPDATED: Asset ${asset} set to ${actionLabel}.`, "info");
-        fetchKpis(); // Refresh table state
+        fetchKpis(); 
     } catch (error) {
         logConsole(`Failed to update ${asset}: ${error.message}`, "err");
     }
