@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|                                 MAPSAR_ProfitEngine_v11_05.mq5       |
+//|                                 MAPSAR_ProfitEngine_v11_06.mq5       |
 //|        Universal Multi-Asset & Micro/Macro Equity Profit Engine   |
 //|  TEMA + AC + SAR + RSI Veto + Volume + MA(10/20/50/100/200)+ADX   |
 //|  Local Orchestrator (FastAPI) Integration with Tier-2 ML Signals  |
@@ -31,7 +31,7 @@
 //|     falling back to the static session inputs otherwise             |
 //+------------------------------------------------------------------+
 #property copyright "InfoScience"
-#property version   "11.04"
+#property version   "11.06"
 // v11.04: EA state (peakEquity, consecutive win/loss streaks, risk cooldown,
 // daily P/L, per-position profit-peak arming) now persists across EA
 // detach/reattach and terminal restarts via MT5 GlobalVariables - see the
@@ -200,6 +200,8 @@ double   db_rsi_buy_max          = 70.0;
 double   db_rsi_sell_min         = 30.0;
 double   db_calibration_score    = 0.0;
 int      mlReversalDisagreeCount = 0;   // v11.3: counts consecutive param-refreshes where Tier-2 AND micro-trend both disagree with the open position
+bool     dailyLossHaltNotified    = false;  // v11.06: edge-trigger so PostRiskIncident() fires once per halt, not every tick
+bool     consecLossHaltNotified   = false;  // v11.06: same, for the max-consecutive-losses breaker
 
 //+------------------------------------------------------------------+
 //| Struct for Web API Response Parsing & Validation                 |
@@ -534,6 +536,66 @@ void PostTelemetry(string asset, string type, double price, double lots, double 
    WebRequest("POST", InpOrchestratorURL + "/telemetry", OrchestratorHeaders("application/json"), 5000, data, result, resultHeaders);
   }
 
+  //+------------------------------------------------------------------+
+//| v11.06: posts the account state the EA already computes locally  |
+//| every heartbeat (peakEquity, dayRealizedPL/dayStartEquity, the    |
+//| circuit-breaker flags) so the orchestrator dashboard can show     |
+//| actual balance/equity instead of only realized closed-trade P/L. |
+//+------------------------------------------------------------------+
+void PostAccountSnapshot()
+  {
+   if(!InpUseOrchestrator) return;
+
+   string accountType = IsDemoAccount() ? "demo" : "live";
+   double balance      = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity       = AccountInfoDouble(ACCOUNT_EQUITY);
+   double margin       = AccountInfoDouble(ACCOUNT_MARGIN);
+   double marginLevel  = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+   double floatingPL   = equity - balance;
+   double ddPct        = (peakEquity > 0) ? (peakEquity - equity) / peakEquity * 100.0 : 0.0;
+   double dayLossPct   = (dayStartEquity > 0 && dayRealizedPL < 0) ? (-dayRealizedPL / dayStartEquity) * 100.0 : 0.0;
+
+   string json = StringFormat(
+      "{\"account_type\":\"%s\",\"login\":%d,\"asset\":\"%s\",\"balance\":%.2f,\"equity\":%.2f,"
+      "\"margin\":%.2f,\"margin_level\":%.2f,\"floating_pl\":%.2f,\"peak_equity\":%.2f,"
+      "\"drawdown_pct\":%.2f,\"day_loss_pct\":%.2f,\"consecutive_losses\":%d,\"consecutive_wins\":%d,"
+      "\"risk_cooldown_active\":%s,\"drawdown_halt\":%s}",
+      accountType, (int)AccountInfoInteger(ACCOUNT_LOGIN), NormalizeAssetKey(), balance, equity,
+      margin, marginLevel, floatingPL, peakEquity, ddPct, dayLossPct,
+      consecutiveLosses, consecutiveWins,
+      riskCooldownActive ? "true" : "false", drawdownHalt ? "true" : "false");
+
+   char data[]; char result[]; string resultHeaders;
+   StringToCharArray(json, data, 0, WHOLE_ARRAY, CP_UTF8);
+   ArrayResize(data, ArraySize(data) - 1);
+
+   WebRequest("POST", InpOrchestratorURL + "/account_snapshot", OrchestratorHeaders("application/json"),
+              InpTickPostTimeoutMs, data, result, resultHeaders);
+  }
+
+//+------------------------------------------------------------------+
+//| v11.06: fires once (edge-triggered by the callers below) whenever|
+//| a local circuit breaker trips, so the dashboard shows WHY trading|
+//| paused instead of the operator only discovering it from a flat   |
+//| equity curve or an empty terminal log they weren't watching.     |
+//+------------------------------------------------------------------+
+void PostRiskIncident(string reason, string details)
+  {
+   if(!InpUseOrchestrator) return;
+
+   string accountType = IsDemoAccount() ? "demo" : "live";
+   string json = StringFormat(
+      "{\"account_type\":\"%s\",\"asset\":\"%s\",\"reason\":\"%s\",\"details\":\"%s\"}",
+      accountType, NormalizeAssetKey(), reason, details);
+
+   char data[]; char result[]; string resultHeaders;
+   StringToCharArray(json, data, 0, WHOLE_ARRAY, CP_UTF8);
+   ArrayResize(data, ArraySize(data) - 1);
+
+   WebRequest("POST", InpOrchestratorURL + "/risk_incident", OrchestratorHeaders("application/json"),
+              InpTickPostTimeoutMs, data, result, resultHeaders);
+  }
+
 void InitDatabaseStrategy()
   {
    if(!InpUseDatabase) return;
@@ -754,6 +816,7 @@ void RefreshDailyCounter()
       dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
       dayRealizedPL  = 0.0;
       consecutiveLosses = 0;
+      dailyLossHaltNotified = false;
      }
   }
 
@@ -767,6 +830,8 @@ void UpdateDrawdownState()
 
    if(drawdownHalt && !wasHalted)
      {
+      PostRiskIncident("drawdown_halt", StringFormat("drawdown_pct=%.2f cap=%.2f peak_equity=%.2f equity=%.2f",
+                        ddPercent, InpMaxDrawdownPercent, peakEquity, eq));
       long type;
       if(HasOpenPosition(type))
         {
@@ -794,6 +859,8 @@ void CheckFloatingLossKillSwitch()
      {
       PrintFormat("KILL SWITCH: floating loss %.2f%% of equity >= cap %.2f%%. Force-closing.",
                   floatingLossPct, InpMaxFloatingLossPercent);
+      PostRiskIncident("floating_loss_kill_switch",
+                        StringFormat("floating_loss_pct=%.2f cap=%.2f", floatingLossPct, InpMaxFloatingLossPercent));
       trade.PositionClose(_Symbol);
      }
   }
@@ -1096,15 +1163,34 @@ bool HasOpenPosition(long &type)
 bool NewEntriesAllowed()
   {
    if(drawdownHalt) return(false);
-   if(consecutiveLosses >= InpMaxConsecutiveLosses) return(false);
-   if(InpUseOrchestrator && !orchestratorHealthy) return(false);
 
+   if(consecutiveLosses >= InpMaxConsecutiveLosses)
+     {
+      if(!consecLossHaltNotified)
+        {
+         PostRiskIncident("max_consecutive_losses",
+                           StringFormat("consecutive_losses=%d cap=%d", consecutiveLosses, InpMaxConsecutiveLosses));
+         consecLossHaltNotified = true;
+        }
+      return(false);
+     }
+
+   if(InpUseOrchestrator && !orchestratorHealthy) return(false);
    if(InpEnforceLiveApproval && !IsDemoAccount() && !db_live_approved) return(false);
 
    if(dayStartEquity > 0)
      {
       double dayLossPct = (-dayRealizedPL / dayStartEquity) * 100.0;
-      if(dayRealizedPL < 0 && dayLossPct >= InpMaxDailyLossPercent) return(false);
+      if(dayRealizedPL < 0 && dayLossPct >= InpMaxDailyLossPercent)
+        {
+         if(!dailyLossHaltNotified)
+           {
+            PostRiskIncident("daily_loss_limit",
+                              StringFormat("day_loss_pct=%.2f cap=%.2f", dayLossPct, InpMaxDailyLossPercent));
+            dailyLossHaltNotified = true;
+           }
+         return(false);
+        }
      }
    return(true);
   }
@@ -1262,6 +1348,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
    else if(profit > 0)
      {
       consecutiveWins++; consecutiveLosses = 0;
+      consecLossHaltNotified = false;
       if(riskCooldownActive && consecutiveWins >= InpWinsToRestoreRisk)
          riskCooldownActive = false;
      }
@@ -1286,6 +1373,8 @@ void OnTimer()
    SStrategyParams params;
    GetCurrentStrategyParams(params);
    CheckInFlightMicroTrendReversal(params);
+
+   PostAccountSnapshot();   // v11.06: heartbeat cadence (default 30s) - cheap, non-blocking on entries since this runs on the timer, not OnTick
 
    SaveEAState();
   }
@@ -1352,6 +1441,15 @@ void PublishLiveState(double localScore)
    else if(db_micro_trend == "SELL") microCode = -1.0;
    GlobalVariableSet(p + "liveMicroTrendCode", microCode);
    GlobalVariableSet(p + "liveMicroTrendStrength", db_micro_trend_strength);
+
+   // v11.06: additional context so MAPSAR_TrendVisualizer can flag signals
+   // as lower-trust (poorly calibrated model, or outside the orchestrator's
+   // scheduled window) instead of always rendering full-confidence colors.
+   GlobalVariableSet(p + "liveCalibrationScore", db_calibration_score);
+   GlobalVariableSet(p + "liveScheduledStartHour", (double)db_scheduled_start_hour);
+   GlobalVariableSet(p + "liveScheduledEndHour", (double)db_scheduled_end_hour);
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   GlobalVariableSet(p + "liveDrawdownPct", (peakEquity > 0) ? (peakEquity - eq) / peakEquity * 100.0 : 0.0);
   }
 
 double OnTester()
