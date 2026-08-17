@@ -20,25 +20,10 @@ async def init_db_pool() -> asyncpg.Pool:
     database_url = os.environ["DATABASE_URL"]
     _pool = await asyncpg.create_pool(
         dsn=database_url,
-        min_size=1,
-        max_size=10,
-        command_timeout=10,
-        # CRITICAL if DATABASE_URL is Supabase's pooled connection string
-        # (Supavisor/pgbouncer, typically port 6543, "Transaction" mode).
-        # asyncpg caches server-side prepared statements by default. In
-        # transaction-pooling mode, pgbouncer can hand the next query to a
-        # different physical Postgres connection than the one that prepared
-        # the statement, so the cached statement name no longer exists there
-        # -> asyncpg.exceptions.InvalidSQLStatementNameError, intermittently,
-        # on whichever request happens to land on a different connection.
-        # This is exactly what caused the /strategy_params 500s and the
-        # cascading /health 503s in the logs. Setting this to 0 disables
-        # server-side statement caching so every query is sent as a fresh
-        # simple/extended query each time - slightly more overhead per call,
-        # correctness over micro-optimization for a service this size.
-        # (If DATABASE_URL is the DIRECT connection, port 5432/session mode,
-        # this isn't strictly required - but it's harmless to leave on, and
-        # protects you the moment anyone switches the connection string.)
+        min_size=2,          # Increased from 1
+        max_size=20,         # Increased from 10 to handle burst polling
+        command_timeout=15,  # Slightly relaxed for complex queries
+        max_inactive_connection_lifetime=300.0, # Recycle stale/hung connections
         statement_cache_size=0,
     )
     return _pool
