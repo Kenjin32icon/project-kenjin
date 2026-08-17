@@ -188,11 +188,13 @@
 
 <script>
 // --- Configuration ---
-const POLL_INTERVAL_MS = 15000;
+const KPI_POLL_INTERVAL_MS = 15000;
+const HEALTH_POLL_INTERVAL_MS = 30000;
 // ---------------------
 
 let chart = null;
 let pollTimer = null;
+let healthTimer = null;
 
 // XSS Sanitization Utility Function
 function escapeHTML(str) {
@@ -206,7 +208,7 @@ function escapeHTML(str) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-    document.getElementById('pollIntervalLabel').textContent = `${POLL_INTERVAL_MS / 1000} seconds`;
+    document.getElementById('pollIntervalLabel').textContent = `${KPI_POLL_INTERVAL_MS / 1000} seconds`;
     if (localStorage.getItem("kenjin_api_key")) document.getElementById("apiKey").value = localStorage.getItem("kenjin_api_key");
     if (localStorage.getItem("kenjin_base_url")) document.getElementById("baseUrl").value = localStorage.getItem("kenjin_base_url");
     if (localStorage.getItem('kenjin_base_url') && localStorage.getItem('kenjin_api_key')) saveAndLoad();
@@ -234,8 +236,28 @@ function saveAndLoad() {
     localStorage.setItem("kenjin_api_key", apiKey);
 
     if (pollTimer) clearInterval(pollTimer);
+    if (healthTimer) clearInterval(healthTimer);
+
     fetchKpis();
-    pollTimer = setInterval(fetchKpis, POLL_INTERVAL_MS);
+    fetchHealth();
+
+    pollTimer = setInterval(fetchKpis, KPI_POLL_INTERVAL_MS);
+    healthTimer = setInterval(fetchHealth, HEALTH_POLL_INTERVAL_MS);
+}
+
+async function fetchHealth() {
+    const baseUrl = getCleanBaseUrl();
+    const dotApi = document.getElementById("dotFastApi");
+    try {
+        const response = await fetch(`${baseUrl}/health`, { method: "GET" });
+        if (response.ok) {
+            dotApi.className = "dot online";
+        } else {
+            dotApi.className = "dot degraded";
+        }
+    } catch (error) {
+        dotApi.className = "dot offline";
+    }
 }
 
 async function fetchKpis() {
