@@ -193,6 +193,7 @@ async def lifespan(app: FastAPI):
         from startup.jobs.gatekeeper import run_gatekeeper_cycle
         from startup.jobs.hour_scheduler import run_hour_scheduler_cycle
         from startup.jobs.confidence_calibration import run_calibration_cycle
+        from startup.jobs.db_pruner import run_snapshot_pruning_cycle
 
         async def run_retrain_cycle():
             df = await fetch_recent_telemetry()
@@ -208,11 +209,12 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(run_hour_scheduler_cycle, "interval", hours=12, id="run_hour_scheduler_cycle")
         scheduler.add_job(run_calibration_cycle, "interval", hours=24, id="run_calibration_cycle")
         scheduler.add_job(continuous_tester_cycle, "interval", hours=4, id="continuous_tester_cycle")
+        scheduler.add_job(run_snapshot_pruning_cycle, "interval", hours=24, id="run_snapshot_pruning_cycle")
 
         scheduler.start()
         logger.info(
             "APScheduler initialized: Forecast (15m), Gatekeeper (1h), ML Retrain (6h), "
-            "Hour Scheduler (12h), Confidence Calibration (24h), AutoTester (4h)."
+            "Hour Scheduler (12h), Confidence Calibration (24h), AutoTester (4h), DB Pruner (24h)."
         )
     except Exception as e:
         logger.warning(f"Failed scheduling background jobs: {e}")
