@@ -89,13 +89,20 @@ async def run_gatekeeper_cycle() -> None:
                 and profit_factor >= MIN_PROFIT_FACTOR
             )
 
-            # Fetch current entry parameters for dynamic autotuning adjustment
+            # Fetch current approval state and parameters for dynamic autotuning adjustment
             current_db = await conn.fetchrow(
-                "SELECT opt_threshold, opt_sl_mult, opt_tp_mult FROM strategy_db WHERE asset = $1", asset
+                "SELECT live_approved, opt_threshold, opt_sl_mult, opt_tp_mult FROM strategy_db WHERE asset = $1", asset
             )
+            current_live_approved = bool(current_db["live_approved"]) if current_db and current_db["live_approved"] is not None else False
             current_thresh = float(current_db["opt_threshold"]) if current_db and current_db["opt_threshold"] is not None else 0.60
             current_sl = float(current_db["opt_sl_mult"]) if current_db and current_db["opt_sl_mult"] is not None else 1.50
             current_tp = float(current_db["opt_tp_mult"]) if current_db and current_db["opt_tp_mult"] is not None else 3.00
+
+            # Preserve current live_approved state if sample size is insufficient
+            if closed < MIN_SAMPLE_SIZE:
+                live_approved = current_live_approved
+            else:
+                live_approved = qualifies
 
             # Dynamic threshold autotuning logic based on rolling performance
             if closed >= 10:
@@ -113,11 +120,11 @@ async def run_gatekeeper_cycle() -> None:
                     live_approved = $5, opt_threshold = $6, opt_sl_mult = $7, opt_tp_mult = $8, updated_at = NOW()
                 WHERE asset = $1
                 """,
-                asset, win_rate, profit_factor, closed, qualifies, current_thresh, current_sl, current_tp
+                asset, win_rate, profit_factor, closed, live_approved, current_thresh, current_sl, current_tp
             )
             log.info(
                 "Gatekeeper: %s -> closed=%d win_rate=%.1f%% pf=%.2f live_approved=%s opt_threshold=%.2f opt_sl_mult=%.2f opt_tp_mult=%.2f",
-                asset, closed, win_rate, profit_factor, qualifies, current_thresh, current_sl, current_tp
+                asset, closed, win_rate, profit_factor, live_approved, current_thresh, current_sl, current_tp
             )
 
     # Autotune RSI veto limits from recent analytics
