@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -40,6 +41,7 @@ from startup.schemas import (
 from startup.jobs.feature_pull import pull_feature_window as pg_pull_feature_window
 from startup.jobs.ml_tier2 import evaluate_tier2_signal, train_neural_maps, compute_micro_trend
 from startup.jobs.ml_tier2 import pull_feature_window as redis_pull_feature_window
+from startup.jobs.auto_tester import continuous_tester_cycle
 from startup.auth import verify_api_key
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -50,6 +52,9 @@ scheduler = AsyncIOScheduler()
 _VALID_MODEL_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*(/[a-z0-9]+(-[a-z0-9]+)*)*$")
 
 MIN_REDIS_ROWS_FOR_HOT_PATH = 8
+
+_KPI_CACHE = {"data": None, "timestamp": 0}
+KPI_CACHE_TTL = 10.0  # 10 seconds
 
 # -----------------------------------------------------------------------------
 # Schema models for admin requests
@@ -162,14 +167,19 @@ async def fetch_recent_telemetry() -> pd.DataFrame:
 
 
 async def get_hot_feature_window(asset: str, minutes: int = 30) -> pd.DataFrame:
-    try:
-        df = await redis_pull_feature_window(asset, window_minutes=minutes)
-        if len(df) >= MIN_REDIS_ROWS_FOR_HOT_PATH:
-            return df
-    except Exception:
-        logger.exception("Redis feature window failed for %s - falling back to Postgres.", asset)
+    for attempt in range(3):
+        try:
+            df = await redis_pull_feature_window(asset, window_minutes=minutes)
+            if len(df) >= MIN_REDIS_ROWS_FOR_HOT_PATH:
+                return df
+            return await pg_pull_feature_window(asset, minutes=minutes)
+        except Exception as e:
+            if attempt == 2:
+                logger.exception("Redis/PG feature window failed entirely for %s.", asset)
+            else:
+                await asyncio.sleep(0.5 + random.uniform(0, 0.5))  # Jittered backoff
 
-    return await pg_pull_feature_window(asset, minutes=minutes)
+    return pd.DataFrame()
 
 
 @asynccontextmanager
@@ -197,12 +207,12 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(run_retrain_cycle, "interval", hours=6, id="run_retrain_cycle")
         scheduler.add_job(run_hour_scheduler_cycle, "interval", hours=12, id="run_hour_scheduler_cycle")
         scheduler.add_job(run_calibration_cycle, "interval", hours=24, id="run_calibration_cycle")
+        scheduler.add_job(continuous_tester_cycle, "interval", hours=4, id="continuous_tester_cycle")
 
         scheduler.start()
         logger.info(
             "APScheduler initialized: Forecast (15m), Gatekeeper (1h), ML Retrain (6h), "
-            "Hour Scheduler (12h), Confidence Calibration (24h). "
-            "AutoTester DISABLED - see auto_tester_review.md."
+            "Hour Scheduler (12h), Confidence Calibration (24h), AutoTester (4h)."
         )
     except Exception as e:
         logger.warning(f"Failed scheduling background jobs: {e}")
@@ -473,172 +483,191 @@ async def trigger_hour_scheduler(background_tasks: BackgroundTasks):
 async def get_kpis():
     """
     v11.4: single endpoint powering static/dashboard.html with CORS support and absolute static pathing.
+    Includes in-memory TTL caching with graceful degradation.
     """
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        per_asset = await conn.fetch(
-            """
-            SELECT
-                t.asset,
-                COUNT(*) FILTER (WHERE t.type LIKE '%CLOSE%') AS closed_trades,
-                COUNT(*) FILTER (WHERE t.type LIKE '%CLOSE%' AND t.profit > 0) AS wins,
-                COALESCE(SUM(t.profit) FILTER (WHERE t.type LIKE '%CLOSE%'), 0) AS total_profit,
-                s.live_approved,
-                s.opt_threshold,
-                s.opt_sl_mult,
-                s.opt_tp_mult,
-                s.scheduled_start_hour,
-                s.scheduled_end_hour,
-                s.calibration_score,
-                s.calibration_n
-            FROM trade_telemetry t
-            FULL OUTER JOIN strategy_db s ON s.asset = t.asset
-            WHERE t.created_at >= NOW() - INTERVAL '30 days' OR t.created_at IS NULL
-            GROUP BY t.asset, s.asset, s.live_approved, s.opt_threshold, s.opt_sl_mult,
-                     s.opt_tp_mult, s.scheduled_start_hour, s.scheduled_end_hour,
-                     s.calibration_score, s.calibration_n
-            ORDER BY COALESCE(t.asset, s.asset)
-            """
-        )
+    global _KPI_CACHE
+    current_time = time.time()
 
-        equity_curve = await conn.fetch(
-            """
-            SELECT created_at, profit,
-                   SUM(profit) OVER (ORDER BY created_at) AS cumulative_profit
-            FROM trade_telemetry
-            WHERE type LIKE '%CLOSE%' AND created_at >= NOW() - INTERVAL '30 days'
-            ORDER BY created_at ASC
-            """
-        )
+    # Return cached data if valid
+    if _KPI_CACHE["data"] and (current_time - _KPI_CACHE["timestamp"]) < KPI_CACHE_TTL:
+        return _KPI_CACHE["data"]
 
-        recent_trades = await conn.fetch(
-            """
-            SELECT asset, type, price, lots, profit, tier2_confidence, created_at
-            FROM trade_telemetry
-            WHERE type LIKE '%CLOSE%'
-            ORDER BY created_at DESC
-            LIMIT 25
-            """
-        )
+    try:
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            per_asset = await conn.fetch(
+                """
+                SELECT
+                    t.asset,
+                    COUNT(*) FILTER (WHERE t.type LIKE '%CLOSE%') AS closed_trades,
+                    COUNT(*) FILTER (WHERE t.type LIKE '%CLOSE%' AND t.profit > 0) AS wins,
+                    COALESCE(SUM(t.profit) FILTER (WHERE t.type LIKE '%CLOSE%'), 0) AS total_profit,
+                    s.live_approved,
+                    s.opt_threshold,
+                    s.opt_sl_mult,
+                    s.opt_tp_mult,
+                    s.scheduled_start_hour,
+                    s.scheduled_end_hour,
+                    s.calibration_score,
+                    s.calibration_n
+                FROM trade_telemetry t
+                FULL OUTER JOIN strategy_db s ON s.asset = t.asset
+                WHERE t.created_at >= NOW() - INTERVAL '30 days' OR t.created_at IS NULL
+                GROUP BY t.asset, s.asset, s.live_approved, s.opt_threshold, s.opt_sl_mult,
+                         s.opt_tp_mult, s.scheduled_start_hour, s.scheduled_end_hour,
+                         s.calibration_score, s.calibration_n
+                ORDER BY COALESCE(t.asset, s.asset)
+                """
+            )
 
-        latest_forecasts = await conn.fetch(
-            """
-            SELECT DISTINCT ON (asset) asset, bullish_prob, bearish_prob, generated_at
-            FROM forecasts
-            ORDER BY asset, generated_at DESC
-            """
-        )
+            equity_curve = await conn.fetch(
+                """
+                SELECT created_at, profit,
+                       SUM(profit) OVER (ORDER BY created_at) AS cumulative_profit
+                FROM trade_telemetry
+                WHERE type LIKE '%CLOSE%' AND created_at >= NOW() - INTERVAL '30 days'
+                ORDER BY created_at ASC
+                """
+            )
 
-        latest_accounts = await conn.fetch(
-            """
-            SELECT DISTINCT ON (account_type) account_type, login, asset, balance, equity, margin,
-                   margin_level, floating_pl, peak_equity, drawdown_pct, day_loss_pct,
-                   consecutive_losses, consecutive_wins, risk_cooldown_active, drawdown_halt, ts
-            FROM account_snapshots
-            ORDER BY account_type, ts DESC
-            """
-        )
+            recent_trades = await conn.fetch(
+                """
+                SELECT asset, type, price, lots, profit, tier2_confidence, created_at
+                FROM trade_telemetry
+                WHERE type LIKE '%CLOSE%'
+                ORDER BY created_at DESC
+                LIMIT 25
+                """
+            )
 
-        recent_incidents = await conn.fetch(
-            """
-            SELECT account_type, asset, reason, details, created_at
-            FROM risk_incidents
-            ORDER BY created_at DESC
-            LIMIT 20
-            """
-        )
+            latest_forecasts = await conn.fetch(
+                """
+                SELECT DISTINCT ON (asset) asset, bullish_prob, bearish_prob, generated_at
+                FROM forecasts
+                ORDER BY asset, generated_at DESC
+                """
+            )
 
-    total_closed = sum(int(r["closed_trades"] or 0) for r in per_asset)
-    total_wins = sum(int(r["wins"] or 0) for r in per_asset)
-    total_profit = sum(float(r["total_profit"] or 0) for r in per_asset)
+            latest_accounts = await conn.fetch(
+                """
+                SELECT DISTINCT ON (account_type) account_type, login, asset, balance, equity, margin,
+                       margin_level, floating_pl, peak_equity, drawdown_pct, day_loss_pct,
+                       consecutive_losses, consecutive_wins, risk_cooldown_active, drawdown_halt, ts
+                FROM account_snapshots
+                ORDER BY account_type, ts DESC
+                """
+            )
 
-    return {
-        "summary": {
-            "total_closed_trades": total_closed,
-            "total_wins": total_wins,
-            "overall_win_rate": round(100.0 * total_wins / total_closed, 1) if total_closed > 0 else 0.0,
-            "total_profit": round(total_profit, 2),
-            "assets_tracked": len(per_asset),
-            "assets_live_approved": sum(1 for r in per_asset if r["live_approved"]),
-        },
-        "per_asset": [
-            {
-                "asset": r["asset"],
-                "closed_trades": int(r["closed_trades"] or 0),
-                "wins": int(r["wins"] or 0),
-                "win_rate": round(100.0 * (r["wins"] or 0) / r["closed_trades"], 1) if (r["closed_trades"] or 0) > 0 else 0.0,
-                "total_profit": round(float(r["total_profit"] or 0), 2),
-                "live_approved": bool(r["live_approved"]) if r["live_approved"] is not None else False,
-                "opt_threshold": float(r["opt_threshold"]) if r["opt_threshold"] is not None else None,
-                "opt_sl_mult": float(r["opt_sl_mult"]) if r["opt_sl_mult"] is not None else None,
-                "opt_tp_mult": float(r["opt_tp_mult"]) if r["opt_tp_mult"] is not None else None,
-                "scheduled_start_hour": r["scheduled_start_hour"],
-                "scheduled_end_hour": r["scheduled_end_hour"],
-                "calibration_score": float(r["calibration_score"]) if r["calibration_score"] is not None else None,
-                "calibration_n": r["calibration_n"],
-            }
-            for r in per_asset if r["asset"] is not None
-        ],
-        "equity_curve": [
-            {
-                "created_at": r["created_at"].isoformat(),
-                "profit": float(r["profit"]),
-                "cumulative_profit": round(float(r["cumulative_profit"]), 2),
-            }
-            for r in equity_curve
-        ],
-        "recent_trades": [
-            {
-                "asset": r["asset"],
-                "type": r["type"],
-                "price": float(r["price"]) if r["price"] is not None else None,
-                "lots": float(r["lots"]) if r["lots"] is not None else None,
-                "profit": float(r["profit"]) if r["profit"] is not None else None,
-                "tier2_confidence": float(r["tier2_confidence"]) if r["tier2_confidence"] is not None else None,
-                "created_at": r["created_at"].isoformat(),
-            }
-            for r in recent_trades
-        ],
-        "latest_forecasts": [
-            {
-                "asset": r["asset"],
-                "bullish_prob": float(r["bullish_prob"]) if r["bullish_prob"] is not None else None,
-                "bearish_prob": float(r["bearish_prob"]) if r["bearish_prob"] is not None else None,
-                "generated_at": r["generated_at"].isoformat(),
-            }
-            for r in latest_forecasts
-        ],
-        "accounts": [
-            {
-                "account_type": r["account_type"],
-                "login": r["login"],
-                "asset": r["asset"],
-                "balance": float(r["balance"]) if r["balance"] is not None else None,
-                "equity": float(r["equity"]) if r["equity"] is not None else None,
-                "floating_pl": float(r["floating_pl"]) if r["floating_pl"] is not None else None,
-                "margin_level": float(r["margin_level"]) if r["margin_level"] is not None else None,
-                "peak_equity": float(r["peak_equity"]) if r["peak_equity"] is not None else None,
-                "drawdown_pct": float(r["drawdown_pct"]) if r["drawdown_pct"] is not None else None,
-                "day_loss_pct": float(r["day_loss_pct"]) if r["day_loss_pct"] is not None else None,
-                "consecutive_losses": r["consecutive_losses"],
-                "risk_cooldown_active": r["risk_cooldown_active"],
-                "drawdown_halt": r["drawdown_halt"],
-                "last_updated": r["ts"].isoformat(),
-                "seconds_since_update": (datetime.now(timezone.utc) - r["ts"]).total_seconds(),
-            }
-            for r in latest_accounts
-        ],
-        "risk_incidents": [
-            {
-                "account_type": r["account_type"],
-                "asset": r["asset"],
-                "reason": r["reason"],
-                "details": r["details"],
-                "created_at": r["created_at"].isoformat(),
-            }
-            for r in recent_incidents
-        ],
-    }
+            recent_incidents = await conn.fetch(
+                """
+                SELECT account_type, asset, reason, details, created_at
+                FROM risk_incidents
+                ORDER BY created_at DESC
+                LIMIT 20
+                """
+            )
+
+        total_closed = sum(int(r["closed_trades"] or 0) for r in per_asset)
+        total_wins = sum(int(r["wins"] or 0) for r in per_asset)
+        total_profit = sum(float(r["total_profit"] or 0) for r in per_asset)
+
+        response_data = {
+            "summary": {
+                "total_closed_trades": total_closed,
+                "total_wins": total_wins,
+                "overall_win_rate": round(100.0 * total_wins / total_closed, 1) if total_closed > 0 else 0.0,
+                "total_profit": round(total_profit, 2),
+                "assets_tracked": len(per_asset),
+                "assets_live_approved": sum(1 for r in per_asset if r["live_approved"]),
+            },
+            "per_asset": [
+                {
+                    "asset": r["asset"],
+                    "closed_trades": int(r["closed_trades"] or 0),
+                    "wins": int(r["wins"] or 0),
+                    "win_rate": round(100.0 * (r["wins"] or 0) / r["closed_trades"], 1) if (r["closed_trades"] or 0) > 0 else 0.0,
+                    "total_profit": round(float(r["total_profit"] or 0), 2),
+                    "live_approved": bool(r["live_approved"]) if r["live_approved"] is not None else False,
+                    "opt_threshold": float(r["opt_threshold"]) if r["opt_threshold"] is not None else None,
+                    "opt_sl_mult": float(r["opt_sl_mult"]) if r["opt_sl_mult"] is not None else None,
+                    "opt_tp_mult": float(r["opt_tp_mult"]) if r["opt_tp_mult"] is not None else None,
+                    "scheduled_start_hour": r["scheduled_start_hour"],
+                    "scheduled_end_hour": r["scheduled_end_hour"],
+                    "calibration_score": float(r["calibration_score"]) if r["calibration_score"] is not None else None,
+                    "calibration_n": r["calibration_n"],
+                }
+                for r in per_asset if r["asset"] is not None
+            ],
+            "equity_curve": [
+                {
+                    "created_at": r["created_at"].isoformat(),
+                    "profit": float(r["profit"]),
+                    "cumulative_profit": round(float(r["cumulative_profit"]), 2),
+                }
+                for r in equity_curve
+            ],
+            "recent_trades": [
+                {
+                    "asset": r["asset"],
+                    "type": r["type"],
+                    "price": float(r["price"]) if r["price"] is not None else None,
+                    "lots": float(r["lots"]) if r["lots"] is not None else None,
+                    "profit": float(r["profit"]) if r["profit"] is not None else None,
+                    "tier2_confidence": float(r["tier2_confidence"]) if r["tier2_confidence"] is not None else None,
+                    "created_at": r["created_at"].isoformat(),
+                }
+                for r in recent_trades
+            ],
+            "latest_forecasts": [
+                {
+                    "asset": r["asset"],
+                    "bullish_prob": float(r["bullish_prob"]) if r["bullish_prob"] is not None else None,
+                    "bearish_prob": float(r["bearish_prob"]) if r["bearish_prob"] is not None else None,
+                    "generated_at": r["generated_at"].isoformat(),
+                }
+                for r in latest_forecasts
+            ],
+            "accounts": [
+                {
+                    "account_type": r["account_type"],
+                    "login": r["login"],
+                    "asset": r["asset"],
+                    "balance": float(r["balance"]) if r["balance"] is not None else None,
+                    "equity": float(r["equity"]) if r["equity"] is not None else None,
+                    "floating_pl": float(r["floating_pl"]) if r["floating_pl"] is not None else None,
+                    "margin_level": float(r["margin_level"]) if r["margin_level"] is not None else None,
+                    "peak_equity": float(r["peak_equity"]) if r["peak_equity"] is not None else None,
+                    "drawdown_pct": float(r["drawdown_pct"]) if r["drawdown_pct"] is not None else None,
+                    "day_loss_pct": float(r["day_loss_pct"]) if r["day_loss_pct"] is not None else None,
+                    "consecutive_losses": r["consecutive_losses"],
+                    "risk_cooldown_active": r["risk_cooldown_active"],
+                    "drawdown_halt": r["drawdown_halt"],
+                    "last_updated": r["ts"].isoformat(),
+                    "seconds_since_update": (datetime.now(timezone.utc) - r["ts"]).total_seconds(),
+                }
+                for r in latest_accounts
+            ],
+            "risk_incidents": [
+                {
+                    "account_type": r["account_type"],
+                    "asset": r["asset"],
+                    "reason": r["reason"],
+                    "details": r["details"],
+                    "created_at": r["created_at"].isoformat(),
+                }
+                for r in recent_incidents
+            ],
+        }
+
+        _KPI_CACHE["data"] = response_data
+        _KPI_CACHE["timestamp"] = current_time
+        return response_data
+
+    except Exception as e:
+        logger.error(f"KPI DB Timeout/Error: {e}. Degrading gracefully.")
+        if _KPI_CACHE["data"]:
+            return _KPI_CACHE["data"]
+        raise HTTPException(status_code=500, detail="Database timeout and no cached data available.")
 
 # -----------------------------------------------------------------------------
 # Control & Job Endpoints
