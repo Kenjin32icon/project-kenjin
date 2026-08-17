@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Header, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Header, status, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -43,6 +43,7 @@ from startup.jobs.ml_tier2 import evaluate_tier2_signal, train_neural_maps, comp
 from startup.jobs.ml_tier2 import pull_feature_window as redis_pull_feature_window
 from startup.jobs.auto_tester import continuous_tester_cycle
 from startup.auth import verify_api_key
+from startup.ws_manager import manager  # [NEW IMPORT]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("orchestrator")
@@ -172,6 +173,7 @@ async def get_hot_feature_window(asset: str, minutes: int = 30) -> pd.DataFrame:
             df = await redis_pull_feature_window(asset, window_minutes=minutes)
             if len(df) >= MIN_REDIS_ROWS_FOR_HOT_PATH:
                 return df
+            return df
             return await pg_pull_feature_window(asset, minutes=minutes)
         except Exception as e:
             if attempt == 2:
@@ -250,6 +252,22 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR, check_dir=False), name="s
 
 
 # --- ROUTES ---
+
+# ==========================================
+# [NEW] WEBSOCKET ROUTE FOR ELECTRON DASHBOARD
+# ==========================================
+@app.websocket("/ws/dashboard")
+async def websocket_dashboard_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive and listen for manual dashboard overrides
+            data = await websocket.receive_text()
+            if data == "PING":
+                await websocket.send_text("PONG")
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
 
 @app.get("/health", response_model=HealthOut, tags=["System Health"], summary="Service and Database Health Check")
 async def health():
@@ -363,6 +381,26 @@ async def get_strategy_params(asset: str):
 async def post_ticks(payload: TickIn, background_tasks: BackgroundTasks):
     background_tasks.add_task(insert_tick_row, payload)
     background_tasks.add_task(cache_tick_to_redis, payload.asset, payload.model_dump())
+    
+    # [NEW] Broadcast real-time micro-trend and price data to dashboard
+    tick_data = payload.model_dump()
+    await manager.broadcast({
+        "type": "TICK_UPDATE",
+        "timestamp": tick_data.get("timestamp", time.time()),
+        "price": tick_data.get("bid", tick_data.get("price")),
+        "micro_trend": tick_data.get("micro_trend", 0.0),
+        "expected_value": tick_data.get("expected_value", 0.0)
+    })
+
+    # [NEW] Hook for Future Online Learning:
+    # If this tick represents a closed trade, broadcast a trigger
+    if tick_data.get("is_trade_close"):
+        await manager.broadcast({
+            "type": "TRADE_CLOSED",
+            "profit": tick_data.get("profit")
+        })
+        # Future function call: await trigger_incremental_learning(tick_data)
+
     return {"status": "accepted", "asset": payload.asset}
 
 
@@ -443,6 +481,15 @@ async def post_risk_incident(payload: RiskIncidentIn):
         raise HTTPException(status_code=500, detail="Failed to store risk incident.")
     logger.warning("RISK INCIDENT: %s | %s | %s | %s",
                     payload.account_type, payload.asset, payload.reason, payload.details)
+    
+    # [NEW] Push high-priority alerts immediately to the UI
+    risk_data = payload.model_dump()
+    await manager.broadcast({
+        "type": "RISK_ALERT",
+        "severity": risk_data.get("severity", "HIGH"),
+        "message": risk_data.get("reason", risk_data.get("message"))
+    })
+
     return {"status": "logged", "reason": payload.reason}
 
 
