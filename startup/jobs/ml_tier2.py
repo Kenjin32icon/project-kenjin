@@ -140,11 +140,11 @@ def train_neural_maps(telemetry_df: pd.DataFrame, risk_value: float = 1.0, opt_t
     X = telemetry_df[features]
 
     y_loss = telemetry_df['is_loss']
-    clf_loss = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05)
+    clf_loss = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05, class_weight='balanced')
     clf_loss.fit(X, y_loss)
 
     y_profit = telemetry_df['is_profit']
-    clf_profit = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05)
+    clf_profit = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05, class_weight='balanced')
     clf_profit.fit(X, y_profit)
 
     win_mask = telemetry_df['is_profit'] == 1
