@@ -83,9 +83,24 @@
   .console-line.info { color: var(--green); }
 
   canvas { max-height: 220px; }
+
+  /* New Risk Banner and Metrics */
+  #risk-banner {
+      display: none;
+      background-color: var(--red);
+      color: white;
+      padding: 15px;
+      font-weight: bold;
+      text-align: center;
+      margin-bottom: 20px;
+      border-radius: 8px;
+  }
+  .metric { font-family: monospace; }
 </style>
 </head>
 <body>
+
+<div id="risk-banner">SYSTEM ALERT: <span id="risk-text"></span></div>
 
 <div class="admin-header">
   <div class="title-group">
@@ -109,6 +124,16 @@
   <span class="status-text" id="statusText"></span>
 </div>
 
+<!-- NEW LIVE STREAM PANEL -->
+<div class="panel" style="margin-bottom: 20px;">
+    <div class="panel-header"><h2>Live Micro-Telemetry Stream</h2></div>
+    <div class="grid-summary" style="margin-bottom: 0;">
+      <div class="card"><div class="label">Current Price</div><div class="value metric" id="live-price">--</div></div>
+      <div class="card"><div class="label">Micro Trend</div><div class="value metric" id="live-trend">--</div></div>
+      <div class="card"><div class="label">Model Expected Value</div><div class="value metric" id="live-ev">--</div></div>
+    </div>
+</div>
+
 <div class="grid-summary" id="summaryCards"></div>
 
 <div class="dashboard-columns">
@@ -127,8 +152,7 @@
       <button class="btn btn-outline" onclick="triggerModelRetrain()">Force LightGBM Retrain</button>
       <button class="btn btn-outline" onclick="triggerCalibrate()">Calibrate Brier Scores</button>
       <div style="font-size: 11px; color: var(--muted); margin-top: 6px;">
-        <div>Latency (Round-Trip): <span id="pingMs" style="color: var(--text);">-- ms</span></div>
-        <div>Active Auto-Polling Interval: <span style="color: var(--text);" id="pollIntervalLabel"></span></div>
+        <div>Connection Type: <span style="color: var(--green);" id="pollIntervalLabel">WebSocket (Live)</span></div>
       </div>
     </div>
   </div>
@@ -187,14 +211,8 @@
 </div>
 
 <script>
-// --- Configuration ---
-const KPI_POLL_INTERVAL_MS = 15000;
-const HEALTH_POLL_INTERVAL_MS = 30000;
-// ---------------------
-
 let chart = null;
-let pollTimer = null;
-let healthTimer = null;
+let socket = null;
 
 // XSS Sanitization Utility Function
 function escapeHTML(str) {
@@ -208,7 +226,6 @@ function escapeHTML(str) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-    document.getElementById('pollIntervalLabel').textContent = `${KPI_POLL_INTERVAL_MS / 1000} seconds`;
     if (localStorage.getItem("kenjin_api_key")) document.getElementById("apiKey").value = localStorage.getItem("kenjin_api_key");
     if (localStorage.getItem("kenjin_base_url")) document.getElementById("baseUrl").value = localStorage.getItem("kenjin_base_url");
     if (localStorage.getItem('kenjin_base_url') && localStorage.getItem('kenjin_api_key')) saveAndLoad();
@@ -218,7 +235,6 @@ function logConsole(msg, type = 'info') {
     const el = document.getElementById('consoleStream');
     const line = document.createElement('div');
     line.className = `console-line ${type}`;
-    // Sanitize the dynamic message while keeping the hardcoded span structure
     line.innerHTML = `<span class="ts">[${new Date().toLocaleTimeString()}]</span> ${escapeHTML(msg)}`;
     el.appendChild(line);
     el.scrollTop = el.scrollHeight;
@@ -229,20 +245,77 @@ function getCleanBaseUrl() {
     return url.replace(/\[.*?\]\((.*?)\)/g, "$1").replace(/[\[\]]/g, "").replace(/\/+$/, "");
 }
 
+// -------------------------------------------------------------------------
+// WebSocket Dynamic Data Integration 
+// -------------------------------------------------------------------------
+function connectWebSocket() {
+    const baseUrl = getCleanBaseUrl();
+    if (!baseUrl) return;
+    
+    // Automatically convert http(s):// to ws(s)://
+    const WS_URL = baseUrl.replace(/^http/, 'ws') + "/ws/dashboard";
+
+    if (socket) socket.close();
+    
+    socket = new WebSocket(WS_URL);
+
+    socket.onopen = function(e) {
+        logConsole("[WS] Connected to Project Kenjin Orchestrator", "info");
+    };
+
+    socket.onmessage = function(event) {
+        const payload = JSON.parse(event.data);
+
+        // Handle Tick Data Stream
+        if (payload.type === "TICK_UPDATE") {
+            document.getElementById("live-price").innerText = payload.price !== undefined ? parseFloat(payload.price).toFixed(5) : "--";
+            document.getElementById("live-trend").innerText = payload.micro_trend || "--";
+            document.getElementById("live-ev").innerText = payload.expected_value !== undefined ? parseFloat(payload.expected_value).toFixed(2) : "--";
+        }
+
+        // Handle Critical Risk Incidents
+        if (payload.type === "RISK_ALERT") {
+            const banner = document.getElementById("risk-banner");
+            document.getElementById("risk-text").innerText = payload.message;
+            banner.style.display = "block";
+            
+            logConsole(`[RISK ALERT] ${payload.message}`, "err");
+            fetchKpis(); // Refresh to update accounts & risk stream DB UI
+            
+            // Auto-hide alert after 10 seconds
+            setTimeout(() => { banner.style.display = "none"; }, 10000);
+        }
+
+        // Handle Trade Closures
+        if (payload.type === "TRADE_CLOSED") {
+            logConsole(`[TRADE CLOSED] P/L Settled: ${payload.profit}`, "info");
+            // Pull the latest KPIs to reflect closed trades & equity accurately
+            fetchKpis();
+        }
+    };
+
+    socket.onclose = function(event) {
+        logConsole("[WS] Disconnected. Reconnecting in 3 seconds...", "warn");
+        setTimeout(connectWebSocket, 3000); // Auto-reconnect logic
+    };
+
+    socket.onerror = function(error) {
+        logConsole(`[WS] Error: Connection Fault`, "err");
+    };
+}
+
 function saveAndLoad() {
     const baseUrl = getCleanBaseUrl();
     const apiKey = document.getElementById("apiKey").value.trim();
     localStorage.setItem("kenjin_base_url", baseUrl);
     localStorage.setItem("kenjin_api_key", apiKey);
 
-    if (pollTimer) clearInterval(pollTimer);
-    if (healthTimer) clearInterval(healthTimer);
-
+    // Initial explicit loads
     fetchKpis();
     fetchHealth();
-
-    pollTimer = setInterval(fetchKpis, KPI_POLL_INTERVAL_MS);
-    healthTimer = setInterval(fetchHealth, HEALTH_POLL_INTERVAL_MS);
+    
+    // Establish WebSocket listener (replaces legacy setTimeout/setInterval polling)
+    connectWebSocket();
 }
 
 async function fetchHealth() {
@@ -264,7 +337,6 @@ async function fetchKpis() {
     const baseUrl = getCleanBaseUrl();
     const apiKey = document.getElementById("apiKey").value.trim();
     const statusEl = document.getElementById('statusText');
-    const startPing = performance.now();
 
     if (!apiKey) {
         statusEl.textContent = 'API Key missing.';
@@ -276,9 +348,6 @@ async function fetchKpis() {
             method: "GET",
             headers: { "X-API-Key": apiKey, "Content-Type": "application/json" }
         });
-
-        const lat = Math.round(performance.now() - startPing);
-        document.getElementById('pingMs').textContent = `${lat} ms`;
 
         if (response.status === 401) {
             statusEl.textContent = 'Auth Failed (401)';
