@@ -73,6 +73,7 @@ async def run_gatekeeper_cycle() -> None:
                     / NULLIF(ABS(SUM(profit) FILTER (WHERE profit < 0)), 0))::numeric, 2) AS profit_factor
             FROM trade_telemetry
             WHERE created_at >= NOW() - INTERVAL '7 days'
+              AND account_type = 'live'  # FIX: Prevent demo leak into Gatekeeper
             GROUP BY asset
             """
         )
