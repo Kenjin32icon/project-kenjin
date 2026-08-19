@@ -145,6 +145,7 @@ async def fetch_recent_telemetry() -> pd.DataFrame:
                 ORDER BY ts DESC LIMIT 1
             ) te ON true
             WHERE tt.created_at >= NOW() - INTERVAL '30 days'
+              AND tt.account_type = 'live'  # FIX: Prevent demo leak into Neural Map
         """)
     if not rows:
         return pd.DataFrame()
