@@ -128,5 +128,17 @@ async def run_gatekeeper_cycle() -> None:
                 asset, closed, win_rate, profit_factor, live_approved, current_thresh, current_sl, current_tp
             )
 
+            await conn.execute(
+                """
+                INSERT INTO autotune_log 
+                (asset, win_rate, profit_factor, sample_size, old_threshold, new_threshold, old_sl, new_sl, old_tp, new_tp, ts)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+                """,
+                asset, win_rate, profit_factor, closed, 
+                current_db["opt_threshold"], current_thresh, 
+                current_db["opt_sl_mult"], current_sl, 
+                current_db["opt_tp_mult"], current_tp
+            )
+
     # Autotune RSI veto limits from recent analytics
     await tune_rsi_veto_from_analytics()
