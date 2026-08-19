@@ -1,3 +1,7 @@
+# ==========================================
+# 3. startup/jobs/ml_tier2.py
+# ==========================================
+
 """
 Tier 2 Micro-Trigger Classifier: Rapid evaluation of tick features
 against Macro LLM bias using a LightGBM Triple 'Neural Map' Engine.
@@ -200,8 +204,17 @@ def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: f
             action = "BUY" if bullish_prob > bearish_prob else "SELL"
 
         confidence = p_profit
-        lot_multiplier = max(0.5, min(2.5, 1.0 + (expected_value / risk_value)))
-        lot_multiplier = max(0.5, min(2.5, lot_multiplier * calibration_multiplier))
+        
+        # FIX: Replace heuristic clip with Kelly Criterion fraction
+        win_loss_ratio = (e_reward / risk_value) if risk_value > 0.0 else 0.01
+        if win_loss_ratio > 0:
+            kelly_fraction = p_profit - (p_loss / win_loss_ratio)
+        else:
+            kelly_fraction = 0.0
+        
+        # Scale a Half-Kelly strategy around the 1.0 base lot multiplier
+        raw_multiplier = 1.0 + (kelly_fraction * 2.0)
+        lot_multiplier = max(0.1, min(3.0, raw_multiplier * calibration_multiplier))
 
         return {
             "action": action,
