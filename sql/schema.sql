@@ -3,9 +3,9 @@
 
 CREATE TABLE public.strategy_db (
   asset text NOT NULL UNIQUE,
-  opt_threshold numeric,
-  opt_sl_mult numeric,
-  opt_tp_mult numeric,
+  opt_threshold numeric CHECK (opt_threshold >= 0.10 AND opt_threshold <= 0.90),
+  opt_sl_mult numeric CHECK (opt_sl_mult >= 0.5 AND opt_sl_mult <= 5.0),
+  opt_tp_mult numeric CHECK (opt_tp_mult >= 0.5 AND opt_tp_mult <= 10.0),
   scheduled_start_hour integer,
   scheduled_end_hour integer,
   live_approved boolean NOT NULL DEFAULT false,
@@ -15,6 +15,9 @@ CREATE TABLE public.strategy_db (
   sample_size integer,
   rsi_buy_max numeric DEFAULT 70.0,
   rsi_sell_min numeric DEFAULT 30.0,
+  calibration_score numeric,
+  calibration_n integer,
+  calibration_updated_at timestamp with time zone,
   CONSTRAINT strategy_db_pkey PRIMARY KEY (asset)
 );
 CREATE TABLE public.trade_telemetry (
@@ -33,6 +36,8 @@ CREATE TABLE public.trade_telemetry (
   account_type text,
   session_hour integer,
   forecast_id bigint,
+  tier2_confidence numeric,
+  micro_trend character varying DEFAULT 'NEUTRAL'::character varying,
   CONSTRAINT trade_telemetry_pkey PRIMARY KEY (id),
   CONSTRAINT trade_telemetry_forecast_id_fkey FOREIGN KEY (forecast_id) REFERENCES public.forecasts(id),
   CONSTRAINT fk_trade_telemetry_forecast FOREIGN KEY (forecast_id) REFERENCES public.forecasts(id)
@@ -47,6 +52,7 @@ CREATE TABLE public.trading_assets (
   is_active boolean DEFAULT true,
   created_at timestamp with time zone DEFAULT now(),
   updated_at timestamp with time zone DEFAULT now(),
+  pip_value numeric,
   CONSTRAINT trading_assets_pkey PRIMARY KEY (asset_id)
 );
 CREATE TABLE public.forecasts (
@@ -105,11 +111,20 @@ CREATE TABLE public.missed_trade_analytics (
   created_at timestamp with time zone DEFAULT now(),
   CONSTRAINT missed_trade_analytics_pkey PRIMARY KEY (id)
 );
+CREATE TABLE public.risk_incidents (
+  id bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
+  account_type text NOT NULL,
+  asset text,
+  reason text NOT NULL,
+  details text,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT risk_incidents_pkey PRIMARY KEY (id)
+);
 CREATE TABLE public.account_snapshots (
-  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  account_type text NOT NULL,          -- 'demo' or 'live'
+  id bigint GENERATED ALWAYS AS IDENTITY NOT NULL,
+  account_type text NOT NULL,
   login bigint,
-  asset text,                          -- which EA instance/chart posted this
+  asset text,
   balance numeric,
   equity numeric,
   margin numeric,
@@ -122,16 +137,6 @@ CREATE TABLE public.account_snapshots (
   consecutive_wins integer,
   risk_cooldown_active boolean,
   drawdown_halt boolean,
-  ts timestamp with time zone NOT NULL DEFAULT now()
+  ts timestamp with time zone NOT NULL DEFAULT now(),
+  CONSTRAINT account_snapshots_pkey PRIMARY KEY (id)
 );
-CREATE INDEX idx_account_snapshots_type_ts ON public.account_snapshots (account_type, ts DESC);
-
-CREATE TABLE public.risk_incidents (
-  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  account_type text NOT NULL,
-  asset text,
-  reason text NOT NULL,                -- 'daily_loss_limit' | 'drawdown_halt' | 'floating_loss_kill_switch' | 'max_consecutive_losses'
-  details text,
-  created_at timestamp with time zone NOT NULL DEFAULT now()
-);
-CREATE INDEX idx_risk_incidents_created_at ON public.risk_incidents (created_at DESC);
