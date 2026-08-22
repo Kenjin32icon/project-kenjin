@@ -17,7 +17,7 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -132,6 +132,8 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 async def fetch_recent_telemetry() -> pd.DataFrame:
     """Helper function to fetch telemetry records joined with raw tick feature context and compute engineered features."""
     pool = get_pool()
+    since = datetime.now(timezone.utc) - timedelta(days=30)
+    
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT 
@@ -144,9 +146,10 @@ async def fetch_recent_telemetry() -> pd.DataFrame:
                 WHERE asset = tt.asset AND ts <= tt.created_at
                 ORDER BY ts DESC LIMIT 1
             ) te ON true
-            WHERE tt.created_at >= NOW() - INTERVAL '30 days'
-              AND tt.account_type = 'live'  # FIX: Prevent demo leak into Neural Map
-        """)
+            WHERE tt.created_at >= $1
+              AND tt.account_type = 'live'  -- FIX: Prevent demo leak into Neural Map
+        """, since)
+        
     if not rows:
         return pd.DataFrame()
 
