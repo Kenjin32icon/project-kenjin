@@ -18,7 +18,11 @@ def compile_project():
         # Backend / Systems / Scripts
         ".py", ".java", ".c", ".cpp", ".h", ".hpp", ".go", ".rs", ".rb", ".php", ".sh", ".bat", ".ps1",
         # Config / Data / Docs
-        ".json", ".yaml", ".yml", ".xml", ".toml", ".ini", ".sql", ".http", ".txt"
+        ".json", ".yaml", ".yml", ".xml", ".toml", ".ini", ".sql", ".http", ".txt",
+        # ML learning script
+        ".pkl",
+        # MetaTrader 5 script
+        ".mq5"
     }
     
     # Common directories to ignore across various tech stacks
@@ -29,7 +33,10 @@ def compile_project():
         "dist", "build", "target", "out", ".next",       # Build outputs
         ".nuxt", "bin", "obj",
         ".idea", ".vscode", ".eclipse",                  # IDE settings
-        ".gemini", "scratch", "tmp", "temp", "logs"      # Temp/misc files
+        ".gemini", "scratch", "tmp", "temp", "logs",     # Temp/misc files
+        # --- Conda Ecosystem & Linux Caches ---
+        "envs", "pkgs", "miniconda3", "anaconda3", 
+        "conda-meta", "conda-bld", ".conda", "ls"
     }
     
     # Specific files to explicitly ignore
@@ -37,17 +44,22 @@ def compile_project():
         "package-lock.json",
         "yarn.lock", 
         "pnpm-lock.yaml",
-        "firebase-service-account.json"
+        "firebase-service-account.json",
+        "conda-lock.yml"                                 # Heavy Conda lock files
     }
     
-    always_include = {"Dockerfile", "Makefile", "requirements.txt", "Gemfile"}
+    # Ensure environment blueprints are compiled
+    always_include = {
+        "Dockerfile", "Makefile", "requirements.txt", "Gemfile",
+        "environment.yml", "meta.yaml"
+    }
 
     with open(output_file, "w", encoding="utf-8") as out_f:
         out_f.write(f"{project_name} - Compiled System Files\n")
         out_f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         out_f.write("="*80 + "\n\n")
         
-        # --- NEW: Structure Overview Generation ---
+        # --- Structure Overview Generation ---
         out_f.write("=== Project Structure Overview ===\n")
         
         files_to_compile = []
@@ -82,8 +94,12 @@ def compile_project():
                     continue
                 # -----------------------
                 
-                # Check if file is size 0 on disk
-                is_file_empty = " [EMPTY]" if os.path.getsize(file_path) == 0 else ""
+                # Robust size check to handle broken symlinks or permission errors
+                try:
+                    is_file_empty = " [EMPTY]" if os.path.getsize(file_path) == 0 else ""
+                except OSError:
+                    is_file_empty = " [BROKEN LINK/UNREADABLE]"
+                    
                 out_f.write(f"{indent}  📄 File/Script: {file}{is_file_empty}\n")
                 
                 # Add to queue if it's a valid extension or always included
@@ -92,7 +108,7 @@ def compile_project():
                     
         out_f.write("\n" + "="*80 + "\n\n")
         
-        # --- EXISTING: Content Compilation ---
+        # --- Content Compilation ---
         out_f.write("=== File Contents ===\n\n")
         
         for file_path in files_to_compile:
