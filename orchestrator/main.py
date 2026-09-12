@@ -42,6 +42,7 @@ from startup.jobs.feature_pull import pull_feature_window as pg_pull_feature_win
 from startup.jobs.ml_tier2 import evaluate_tier2_signal, train_neural_maps, compute_micro_trend
 from startup.jobs.ml_tier2 import pull_feature_window as redis_pull_feature_window
 from startup.jobs.auto_tester import continuous_tester_cycle
+from startup.jobs import lifeline_engine          # <-- NEW
 from startup.auth import verify_api_key
 from startup.ws_manager import manager  # [NEW IMPORT]
 
@@ -342,11 +343,14 @@ async def get_strategy_params(asset: str):
     else:
         calibration_multiplier = 1.0
 
+    # [NEW] Strategic Profit Lifeline gate
+    lifeline_multiplier, lifeline_terminated = await lifeline_engine.get_lifeline_multiplier(asset)
+
     try:
         df = await get_hot_feature_window(asset, minutes=30)
         tier2 = await asyncio.to_thread(
             evaluate_tier2_signal, df, bullish_prob, bearish_prob, opt_threshold,
-            1.0, calibration_multiplier,
+            1.0, calibration_multiplier, lifeline_multiplier, lifeline_terminated,
         )
         micro = compute_micro_trend(df)
     except Exception:
@@ -361,7 +365,7 @@ async def get_strategy_params(asset: str):
         opt_tp_mult=float(row["opt_tp_mult"]) if row["opt_tp_mult"] is not None else 3.0,
         rsi_buy_max=float(row["rsi_buy_max"]) if row["rsi_buy_max"] is not None else 70.0,
         rsi_sell_min=float(row["rsi_sell_min"]) if row["rsi_sell_min"] is not None else 30.0,
-        live_approved=bool(row["live_approved"]),
+        live_approved=bool(row["live_approved"]) and not lifeline_terminated,  # [CHANGED] defense in depth
         forecast_id=forecast["id"] if forecast else None,
         bullish_prob=bullish_prob,
         bearish_prob=bearish_prob,
@@ -415,7 +419,7 @@ async def post_ticks(payload: TickIn, background_tasks: BackgroundTasks):
     tags=["Telemetry"],
     summary="Log Trade Execution Telemetry",
 )
-async def post_telemetry(payload: TelemetryIn):
+async def post_telemetry(payload: TelemetryIn, background_tasks: BackgroundTasks):
     pool = get_pool()
     try:
         async with pool.acquire() as conn:
@@ -433,6 +437,12 @@ async def post_telemetry(payload: TelemetryIn):
     except Exception:
         logger.exception("Failed to insert trade_telemetry row for %s", payload.asset)
         raise HTTPException(status_code=500, detail="Failed to store telemetry.")
+    
+    # [NEW] Strategic Profit Lifeline: only closed trades carry a settled
+    # profit/loss, so only CLOSE events feed the survival economy.
+    if payload.account_type == "live" and "CLOSE" in (payload.type or ""):
+        background_tasks.add_task(lifeline_engine.record_trade_outcome, payload.asset, payload.profit)
+        
     return {"status": "logged", "asset": payload.asset}
 
 @app.post(
@@ -725,6 +735,16 @@ async def get_kpis():
 # -----------------------------------------------------------------------------
 # Control & Job Endpoints
 # -----------------------------------------------------------------------------
+
+class LifelineResetRequest(BaseModel):
+    asset: str
+    reason: Optional[str] = "Manual operator re-arm"
+
+@app.post("/control/lifeline_reset", dependencies=[Depends(verify_api_key)], tags=["Control"])
+async def lifeline_reset(payload: LifelineResetRequest):
+    """Re-arms an asset the Strategic Profit Lifeline engine hard-terminated."""
+    await lifeline_engine.manual_reset(payload.asset, payload.reason)
+    return {"status": "success", "asset": payload.asset, "message": "Lifeline reset to baseline."}
 
 @app.post("/control/kill_switch", dependencies=[Depends(verify_api_key)], tags=["Control"])
 async def emergency_kill_switch(payload: KillSwitchRequest):
