@@ -12,3 +12,5 @@ electron-app/node_modules
 Local postgreql database configuration
 docker-compose.yml
 Docs/PROJECT_KENJIN_REFACTOR_PLAN.md.pdf
+.migration_tmp/kenjin_supabase.dump
+scripts/migrate_supabase_to_local.sh

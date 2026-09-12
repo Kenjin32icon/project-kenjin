@@ -6,6 +6,19 @@
 Tier 2 Micro-Trigger Classifier: Rapid evaluation of tick features
 against Macro LLM bias using a LightGBM Triple 'Neural Map' Engine.
 Includes an in-memory caching mechanism and a heuristic fallback for cold starts.
+
+STRATEGIC PROFIT LIFELINE UPDATE (see startup/jobs/lifeline_engine.py):
+  - The reward regressor ("map_reward.pkl") is no longer trained only on
+    winning trades with reward=profit. It is trained on EVERY closed trade
+    using a signed, loss-averse utility target:
+        reward_utility = profit                        if profit >= 0
+        reward_utility = profit * LOSS_AVERSION_FACTOR  if profit <  0
+    This makes the model's own EV estimate loss-averse, not just the
+    position-sizing gate on top of it.
+  - evaluate_tier2_signal() now takes lifeline_multiplier / lifeline_terminated
+    so a per-asset "survival economy" gates and scales the signal: a
+    terminated asset is forced to HOLD with zero size, a wounded asset is
+    throttled, and a hot streak is allowed to scale size up (capped).
 """
 import os
 import time
@@ -16,6 +29,11 @@ import pandas as pd
 import lightgbm as lgb
 from typing import List, Dict, Tuple
 from db.redis_client import redis_client
+
+# Keep in sync with startup/jobs/lifeline_engine.py's LOSS_AVERSION_FACTOR.
+# Duplicated here (rather than imported) so ml_tier2.py has no hard runtime
+# dependency on the DB-backed lifeline module - it only needs the constant.
+LOSS_AVERSION_FACTOR = 2.5
 
 # Global cache for the models to prevent disk I/O bottlenecks
 _model_cache = {}
@@ -123,8 +141,26 @@ def get_models():
     return _model_cache
 
 
+def compute_reward_utility(profit: pd.Series) -> pd.Series:
+    """
+    Signed, loss-averse utility used as the reward regression target and
+    persisted to trade_telemetry.reward_utility for audit/backtesting.
+    A win of $50 scores +50. A loss of $50 scores -125 (2.5x) - the model
+    is trained to fear the downside more than it enjoys the upside.
+    """
+    return np.where(profit >= 0, profit, profit * LOSS_AVERSION_FACTOR)
+
+
 def train_neural_maps(telemetry_df: pd.DataFrame, risk_value: float = 1.0, opt_threshold: float = 0.1) -> bool:
-    """Trains the Triple Neural Map models on historical tick telemetry."""
+    """
+    Trains the Triple Neural Map models on historical tick telemetry.
+
+    CHANGE FROM v11: the reward regressor now trains on the signed,
+    loss-averse reward_utility across ALL closed trades (wins and losses),
+    not just reward=profit.clip(lower=0) restricted to winners. This means
+    evaluate_tier2_signal()'s expected_value calculation is itself
+    loss-averse, on top of the lifeline gate applied afterwards.
+    """
     global _model_cache
 
     if telemetry_df.empty or 'profit' not in telemetry_df.columns:
@@ -132,7 +168,7 @@ def train_neural_maps(telemetry_df: pd.DataFrame, risk_value: float = 1.0, opt_t
 
     telemetry_df['is_loss'] = (telemetry_df['profit'] < 0).astype(int)
     telemetry_df['is_profit'] = (telemetry_df['profit'] > 0).astype(int)
-    telemetry_df['reward'] = telemetry_df['profit'].clip(lower=0)
+    telemetry_df['reward_utility'] = compute_reward_utility(telemetry_df['profit'])
 
     features = ['ma_spread_delta', 'price_velocity_1m', 'rsi', 'rvol']
 
@@ -151,15 +187,10 @@ def train_neural_maps(telemetry_df: pd.DataFrame, risk_value: float = 1.0, opt_t
     clf_profit = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05, class_weight='balanced')
     clf_profit.fit(X, y_profit)
 
-    win_mask = telemetry_df['is_profit'] == 1
-    if win_mask.sum() > 0:
-        X_wins = X[win_mask]
-        y_reward = telemetry_df.loc[win_mask, 'reward']
-        reg_reward = lgb.LGBMRegressor(n_estimators=100, learning_rate=0.05)
-        reg_reward.fit(X_wins, y_reward)
-    else:
-        reg_reward = lgb.LGBMRegressor(n_estimators=10, learning_rate=0.05)
-        reg_reward.fit(X, telemetry_df['reward'])
+    # Reward regressor now sees the full, signed, loss-averse utility across
+    # every trade (previously: only wins, target clipped at 0).
+    reg_reward = lgb.LGBMRegressor(n_estimators=150, learning_rate=0.05)
+    reg_reward.fit(X, telemetry_df['reward_utility'])
 
     os.makedirs('models', exist_ok=True)
     joblib.dump(clf_loss, 'models/map_loss.pkl')
@@ -171,10 +202,23 @@ def train_neural_maps(telemetry_df: pd.DataFrame, risk_value: float = 1.0, opt_t
 
 
 def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: float, opt_threshold: float,
-                           risk_value: float = 1.0, calibration_multiplier: float = 1.0) -> dict:
+                           risk_value: float = 1.0, calibration_multiplier: float = 1.0,
+                           lifeline_multiplier: float = 1.0, lifeline_terminated: bool = False) -> dict:
     """
-    Evaluates real-time ticks using the Triple Neural Map, applying EV veto logic and calibration.
+    Evaluates real-time ticks using the Triple Neural Map, applying EV veto
+    logic, calibration, and the Strategic Profit Lifeline gate.
+
+    lifeline_multiplier / lifeline_terminated come from
+    startup.jobs.lifeline_engine.get_lifeline_multiplier(asset) and represent
+    the asset's current "survival economy" state:
+      - lifeline_terminated=True forces HOLD / zero size immediately,
+        before any EV math runs, regardless of how good the signal looks.
+      - lifeline_multiplier scales lot_multiplier alongside calibration_multiplier:
+        > 1.0 on a hot streak, < 1.0 once the asset has taken damage.
     """
+    if lifeline_terminated:
+        return {"action": "HOLD", "confidence": 0.0, "lot_multiplier": 0.0, "lifeline_terminated": True}
+
     if df.empty or len(df) < 5:
         return {"action": "HOLD", "confidence": 0.0, "lot_multiplier": 1.0}
 
@@ -193,9 +237,13 @@ def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: f
     if models:
         p_loss = models['loss'].predict_proba(current_features_df)[0][1]
         p_profit = models['profit'].predict_proba(current_features_df)[0][1]
-        e_reward = models['reward'].predict(current_features_df)[0]
+        e_utility = models['reward'].predict(current_features_df)[0]  # signed, loss-averse
 
-        expected_value = (p_profit * e_reward) - (p_loss * risk_value)
+        # e_utility already carries the loss-averse weighting baked in from
+        # training, so the EV blend below only needs to combine it with the
+        # win/loss probabilities - it is not re-multiplied by LOSS_AVERSION_FACTOR
+        # a second time.
+        expected_value = (p_profit * max(e_utility, 0.0)) - (p_loss * risk_value)
 
         # Tier-2 Veto: Block execution if loss probability exceeds 40% or EV is non-positive / below threshold
         if p_loss > 0.40 or expected_value <= opt_threshold:
@@ -204,22 +252,25 @@ def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: f
             action = "BUY" if bullish_prob > bearish_prob else "SELL"
 
         confidence = p_profit
-        
-        # FIX: Replace heuristic clip with Kelly Criterion fraction
-        win_loss_ratio = (e_reward / risk_value) if risk_value > 0.0 else 0.01
+
+        # Kelly Criterion fraction (win/loss ratio uses the positive side of
+        # the loss-averse utility so sizing doesn't get distorted by the
+        # already-punitive downside scaling).
+        win_loss_ratio = (max(e_utility, 0.0) / risk_value) if risk_value > 0.0 else 0.01
         if win_loss_ratio > 0:
             kelly_fraction = p_profit - (p_loss / win_loss_ratio)
         else:
             kelly_fraction = 0.0
-        
+
         # Scale a Half-Kelly strategy around the 1.0 base lot multiplier
         raw_multiplier = 1.0 + (kelly_fraction * 2.0)
-        lot_multiplier = max(0.1, min(3.0, raw_multiplier * calibration_multiplier))
+        lot_multiplier = raw_multiplier * calibration_multiplier * lifeline_multiplier
+        lot_multiplier = max(0.1, min(3.0, lot_multiplier))
 
         return {
             "action": action,
             "confidence": float(round(confidence, 3)),
-            "lot_multiplier": float(round(lot_multiplier, 2))
+            "lot_multiplier": float(round(lot_multiplier, 2)),
         }
 
     else:
@@ -249,10 +300,11 @@ def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: f
             action = "SELL"
 
         lot_multiplier = max(0.5, min(2.5, 1.0 + (abs(llm_bias) * 1.5)))
-        lot_multiplier = max(0.5, min(2.5, lot_multiplier * calibration_multiplier))
+        lot_multiplier = lot_multiplier * calibration_multiplier * lifeline_multiplier
+        lot_multiplier = max(0.1, min(2.5, lot_multiplier))
 
         return {
             "action": action,
             "confidence": float(round(confidence, 3)),
-            "lot_multiplier": float(round(lot_multiplier, 2))
+            "lot_multiplier": float(round(lot_multiplier, 2)),
         }
