@@ -1,0 +1,35 @@
+# environment.yml — Miniconda environment for Project Kenjin's orchestrator
+# and ML jobs (numpy/pandas/lightgbm/scikit-learn), sourced from
+# conda-forge only (never the `defaults` channel, to avoid Anaconda's
+# commercial ToS on the free "defaults" channel).
+#
+# Create:   conda env create -f environment.yml
+# Update:   conda env update -f environment.yml --prune
+# Activate: conda activate kenjin
+#
+# See PROJECT_KENJIN_REFACTOR_PLAN.md, section "Miniconda research", for why
+# this is offered as an alternative to orchestrator/.venv rather than a
+# replacement for it - both are supported by start_kenjin.sh via USE_CONDA=1.
+name: kenjin
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy=2.4.*
+  - pandas=3.0.*
+  - scikit-learn=1.4.*
+  - lightgbm=4.3.*          # conda-forge build links OpenMP + optimized BLAS out of the box
+  - libblas=*=*openblas     # pin the BLAS backend explicitly for reproducibility across machines
+  - redis-py=5.*
+  - asyncpg=0.31.*
+  - postgresql=16.*         # bundles psql/pg_dump/pg_restore client tools for scripts/migrate_supabase_to_local.sh
+  - pip:
+    - fastapi==0.141.1
+    - uvicorn[standard]==0.52.1
+    - APScheduler==3.11.3
+    - pydantic==2.13.4
+    - python-dotenv==1.2.2
+    - groq==1.6.0
+    - websockets
