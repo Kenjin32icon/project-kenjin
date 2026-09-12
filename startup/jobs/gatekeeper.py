@@ -1,9 +1,18 @@
 """
 Gatekeeper Autotuning Job: Evaluates rolling trade performance on a ~4-hour cadence,
 computing win rate, profit factor, and sample size from trade_telemetry.
-Dynamically updates approval flags (`live_approved`), self-tunes entry 
+Dynamically updates approval flags (`live_approved`), self-tunes entry
 thresholds (`opt_threshold`), stop-loss (`opt_sl_mult`), and take-profit (`opt_tp_mult`)
 multipliers, and parses analytics to adjust RSI veto thresholds.
+
+STRATEGIC PROFIT LIFELINE UPDATE: the Gatekeeper's win-rate/profit-factor
+approval logic runs independently of startup/jobs/lifeline_engine.py, which
+reacts per-trade in real time. That means a stats-based "qualifies" verdict
+computed here must never silently re-approve an asset the lifeline engine
+has already hard-terminated - termination is a deliberate circuit breaker
+that only a human operator can lift (lifeline_engine.manual_reset()).
+This file now reconciles against strategy_lifeline.terminated before
+persisting live_approved.
 
 HARDENED:
   - Uses positional $1/$2 asyncpg bindings instead of named parameters.
@@ -136,28 +145,41 @@ async def _log_risk_incident_if_revoked(conn, asset, was_approved, now_approved,
         )
 
 
+async def _fetch_lifeline_terminated_assets(conn) -> set:
+    """
+    Assets currently hard-terminated by the Strategic Profit Lifeline engine
+    (startup/jobs/lifeline_engine.py). The Gatekeeper must never re-approve
+    these on its own - only a human calling lifeline_engine.manual_reset()
+    lifts a termination.
+    """
+    rows = await conn.fetch("SELECT asset FROM strategy_lifeline WHERE terminated = true")
+    return {r["asset"] for r in rows}
+
+
 async def run_gatekeeper_cycle() -> None:
     """Evaluates rolling trade performance and autotunes strategy parameters per asset."""
     pool = get_pool()
     since = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
-    
+
     async with pool.acquire() as conn:
         assets = await _fetch_tracked_assets(conn)
+        terminated_assets = await _fetch_lifeline_terminated_assets(conn)
 
     evaluated = 0
     approved = 0
+    lifeline_blocked = 0
 
     for asset in assets:
         try:
             async with pool.acquire() as conn:
                 # 1. Fetch historical DB states & closed trades
                 current_db = await conn.fetchrow(
-                    "SELECT live_approved, opt_threshold, opt_sl_mult, opt_tp_mult FROM strategy_db WHERE asset = $1", 
+                    "SELECT live_approved, opt_threshold, opt_sl_mult, opt_tp_mult FROM strategy_db WHERE asset = $1",
                     asset
                 )
                 if not current_db:
                     continue
-                
+
                 current_live_approved = bool(current_db["live_approved"]) if current_db["live_approved"] is not None else False
                 current_thresh = float(current_db["opt_threshold"]) if current_db["opt_threshold"] is not None else 0.60
                 current_sl = float(current_db["opt_sl_mult"]) if current_db["opt_sl_mult"] is not None else 1.50
@@ -177,6 +199,23 @@ async def run_gatekeeper_cycle() -> None:
                     live_approved = current_live_approved
                 else:
                     live_approved = qualifies
+
+                # 2b. Lifeline override: a statistically "qualifying" asset
+                # is still forced to live_approved=False if the Strategic
+                # Profit Lifeline engine has hard-terminated it. This is a
+                # deliberate circuit breaker, not a bug - the Gatekeeper's
+                # 7-day rolling stats can look fine even while an asset just
+                # burned through a losing streak severe enough to trip the
+                # lifeline floor a few hours ago.
+                if asset in terminated_assets:
+                    if live_approved:
+                        log.warning(
+                            "Gatekeeper: %s statistically qualifies (win_rate=%.1f%% pf=%.2f) "
+                            "but is LIFELINE-TERMINATED - forcing live_approved=False.",
+                            asset, win_rate, profit_factor,
+                        )
+                    live_approved = False
+                    lifeline_blocked += 1
 
                 # 3. Dynamic Threshold Autotuning Logic
                 if sample_size >= 10:
@@ -200,13 +239,13 @@ async def run_gatekeeper_cycle() -> None:
 
                 await conn.execute(
                     """
-                    INSERT INTO autotune_log 
+                    INSERT INTO autotune_log
                     (asset, win_rate, profit_factor, sample_size, old_threshold, new_threshold, old_sl, new_sl, old_tp, new_tp, ts)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
                     """,
-                    asset, win_rate, profit_factor, sample_size, 
-                    current_db["opt_threshold"], current_thresh, 
-                    current_db["opt_sl_mult"], current_sl, 
+                    asset, win_rate, profit_factor, sample_size,
+                    current_db["opt_threshold"], current_thresh,
+                    current_db["opt_sl_mult"], current_sl,
                     current_db["opt_tp_mult"], current_tp
                 )
 
@@ -228,8 +267,8 @@ async def run_gatekeeper_cycle() -> None:
             continue
 
     log.info(
-        "Gatekeeper cycle complete: %d/%d assets evaluated, %d approved for live trading",
-        evaluated, len(assets), approved,
+        "Gatekeeper cycle complete: %d/%d assets evaluated, %d approved for live trading, %d blocked by lifeline termination",
+        evaluated, len(assets), approved, lifeline_blocked,
     )
 
     # 5. Autotune RSI veto limits from recent analytics
