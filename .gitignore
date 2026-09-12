@@ -11,3 +11,4 @@ db/__pycache__/redis_client.cpython-311.pyc
 electron-app/node_modules
 Local postgreql database configuration
 docker-compose.yml
+Docs/PROJECT_KENJIN_REFACTOR_PLAN.md.pdf
