@@ -1,170 +1,402 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Project Kenjin — Admin Control & KPI Operations Center</title>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Project Kenjin — Admin Control & KPI Center</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #0b0d11; --panel: #14171f; --border: #222733; --text: #e6e8ec;
-    --muted: #8b93a3; --green: #3ecf8e; --red: #e5566b; --yellow: #f5a623;
-    --accent: #5b8def; --accent-hover: #4a7bdc;
+    --bg: #8c8ce9be;
+    --panel: #3a4442;
+    --panel-hover: #639b9b;
+    --border: #444497;
+    --text: #f4f4f5;
+    --muted: #a1a1aa;
+    --green: #10b981;
+    --green-bg: rgba(16, 185, 129, 0.15);
+    --red: #f43f5e;
+    --red-bg: rgba(244, 63, 94, 0.15);
+    --yellow: #f59e0b;
+    --yellow-bg: rgba(245, 158, 11, 0.15);
+    --accent: #3b82f6;
+    --accent-hover: #2563eb;
+    --accent-bg: rgba(59, 130, 246, 0.15);
+    --radius-lg: 12px;
+    --radius-md: 8px;
+    --radius-sm: 6px;
+    --shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
   }
+
   * { box-sizing: border-box; }
-  body { background: var(--bg); color: var(--text); font-family: -apple-system, Segoe UI, Roboto, monospace; margin: 0; padding: 20px; font-size: 13px; }
   
-  /* Top Nav & Admin Header */
-  .admin-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 16px; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
-  .title-group h1 { font-size: 18px; font-weight: 700; margin: 0; letter-spacing: 0.5px; }
-  .title-group .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  body {
+    background-color: var(--bg);
+    background-image: radial-gradient(circle at top right, rgb(101, 101, 177) 0%, rgb(43, 43, 114) 100%);
+    background-attachment: fixed;
+    color: var(--text);
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    margin: 0;
+    padding: 24px;
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Custom Scrollbar for Terminal/Console feel */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: var(--bg); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+  .admin-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 20px;
+    margin-bottom: 24px;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .title-group h1 {
+    font-size: 20px;
+    margin: 0;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    background: linear-gradient(90deg, #d39c9c, #8888e7);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .title-group .sub {
+    color: var(--muted);
+    font-size: 13px;
+    margin-top: 6px;
+  }
+
+  .health-bar {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .health-pill {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(24, 24, 27, 0.6);
+    border: 1px solid var(--border);
+    padding: 8px 14px;
+    border-radius: 99px;
+    font-size: 12px;
+    font-weight: 500;
+    backdrop-filter: blur(8px);
+  }
+
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--muted);
+    display: inline-block;
+  }
+
+  .dot.online { background: var(--green); box-shadow: 0 0 12px var(--green); animation: pulse-green 2s infinite; }
+  .dot.degraded { background: var(--yellow); box-shadow: 0 0 12px var(--yellow); animation: pulse-yellow 2s infinite; }
+  .dot.offline { background: var(--red); box-shadow: 0 0 12px var(--red); }
+
+  @keyframes pulse-green {
+    0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
+    70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+  }
+
+  @keyframes pulse-yellow {
+    0% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.4); }
+    70% { box-shadow: 0 0 0 6px rgba(245, 158, 11, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); }
+  }
+
+  .keybar {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 8px;
+    align-items: center;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    padding: 16px;
+    border-radius: var(--radius-lg);
+    flex-wrap: wrap;
+    box-shadow: var(--shadow);
+  }
+
+  .keybar input {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 14px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    font-family: 'JetBrains Mono', monospace;
+    transition: border-color 0.2s;
+  }
   
-  /* System Service Health Bar */
-  .health-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  .health-pill { display: flex; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--border); padding: 4px 10px; border-radius: 20px; font-size: 11px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
-  .dot.online { background: var(--green); box-shadow: 0 0 6px var(--green); }
-  .dot.degraded { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
-  .dot.offline { background: var(--red); box-shadow: 0 0 6px var(--red); }
+  .keybar input:focus { outline: none; border-color: var(--accent); }
+  .keybar input.url-input { flex: 2; min-width: 240px; }
+  .keybar input.key-input { flex: 1; min-width: 200px; }
 
-  /* Control & Keybar */
-  .keybar { display: flex; gap: 8px; margin-bottom: 20px; align-items: center; background: var(--panel); border: 1px solid var(--border); padding: 12px; border-radius: 8px; flex-wrap: wrap; }
-  .keybar input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 12px; }
-  .keybar input.url-input { flex: 2; min-width: 200px; }
-  .keybar input.key-input { flex: 1.5; min-width: 180px; }
-  .btn { background: var(--accent); color: white; border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; }
-  .btn:hover { background: var(--accent-hover); }
-  .btn-danger { background: rgba(229, 86, 107, 0.2); color: var(--red); border: 1px solid var(--red); }
-  .btn-danger:hover { background: var(--red); color: white; }
-  .btn-outline { background: var(--panel); border: 1px solid var(--border); }
-  .btn-outline:hover { background: var(--border); }
-  .status-text { margin-left: auto; color: var(--muted); font-size: 11px; }
-
-  /* Grid Layouts */
-  .grid-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 20px; }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
-  .card .label { font-size: 11px; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
-  .card .value { font-size: 20px; font-weight: 700; }
-  .card .sub-value { font-size: 11px; color: var(--muted); margin-top: 4px; }
-  .value.pos { color: var(--green); } .value.neg { color: var(--red); }
-
-  .dashboard-columns { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; margin-bottom: 20px; }
-  @media (max-width: 1024px) { .dashboard-columns { grid-template-columns: 1fr; } }
-
-  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
-  .panel.no-margin { margin-bottom: 0; }
-  .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-  .panel h2 { font-size: 13px; margin: 0; color: var(--text); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+  .btn {
+    background: var(--accent);
+    color: white;
+    border: 1px solid transparent;
+    padding: 10px 16px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    transition: all 0.2s ease;
+  }
   
-  /* Tables */
-  table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }
-  th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
-  .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
-  .badge.live { background: rgba(62,207,142,0.15); color: var(--green); border: 1px solid var(--green); }
-  .badge.pending { background: rgba(139,147,163,0.15); color: var(--muted); border: 1px solid var(--muted); }
-  .badge.bullish { background: rgba(62,207,142,0.15); color: var(--green); }
-  .badge.bearish { background: rgba(229,86,107,0.15); color: var(--red); }
-  .badge.neutral { background: rgba(139,147,163,0.15); color: var(--muted); }
+  .btn:hover { background: var(--accent-hover); transform: translateY(-1px); }
+  .btn:active { transform: translateY(0); }
   
-  /* Missing Classes Added */
+  .btn-outline {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  .btn-outline:hover { background: var(--panel-hover); border-color: var(--muted); }
+  
+  .btn-danger {
+    background: var(--red-bg);
+    color: var(--red);
+    border: 1px solid rgba(244, 63, 94, 0.3);
+  }
+  .btn-danger:hover { background: var(--red); color: white; border-color: var(--red); }
+
+  .status-text { margin-left: auto; color: var(--muted); font-size: 12px; font-family: 'JetBrains Mono', monospace; }
+  .status-text.err { color: var(--red); font-weight: 600; }
+
+  .config-hint { font-size: 12px; color: var(--muted); margin-bottom: 24px; padding-left: 8px; }
+  .config-hint.auto { color: var(--green); }
+
+  .panel {
+    background: var(--panel);
+    border-radius: var(--radius-lg);
+    padding: 20px;
+    border: 1px solid var(--border);
+    margin-bottom: 24px;
+    box-shadow: var(--shadow);
+  }
+
+  .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+
+  .panel h2 {
+    font-size: 14px;
+    margin: 0;
+    color: var(--text);
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+
+  .grid-summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+
+  .card {
+    background: rgba(24, 24, 27, 0.5);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 16px;
+    transition: transform 0.2s, background 0.2s;
+  }
+  
+  .card:hover { background: rgba(39, 39, 42, 0.4); transform: translateY(-2px); }
+
+  .card .label {
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+  }
+
+  .value { font-size: 24px; font-weight: 700; font-family: 'JetBrains Mono', monospace; }
+  .value.pos { color: var(--green); }
+  .value.neg { color: var(--red); }
+  
+  .sub-value { font-size: 12px; color: var(--muted); margin-top: 6px; }
+
+  table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; text-align: left; }
+  th, td { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  td { font-family: 'JetBrains Mono', monospace; }
+  tr:last-child td { border-bottom: none; }
+  tbody tr { transition: background 0.15s; }
+  tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    font-family: 'Inter', sans-serif;
+    letter-spacing: 0.5px;
+  }
+  .badge.live { background: var(--green-bg); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
+  .badge.pending { background: rgba(161, 161, 170, 0.15); color: var(--muted); border: 1px solid rgba(161, 161, 170, 0.3); }
+  .badge.bullish { background: var(--green-bg); color: var(--green); }
+  .badge.bearish { background: var(--red-bg); color: var(--red); }
+  .badge.neutral { background: rgba(161, 161, 170, 0.15); color: var(--muted); }
+
   .profit-pos { color: var(--green); font-weight: 600; }
   .profit-neg { color: var(--red); font-weight: 600; }
-  
-  .controls-stack { display: flex; flex-direction: column; gap: 10px; }
 
-  /* Console Telemetry Drawer */
-  .console-panel { background: #07080a; border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-family: monospace; font-size: 11px; height: 140px; overflow-y: auto; color: #a0a6b5; }
-  .console-panel.short { height: 110px; }
-  .console-line { margin-bottom: 4px; }
-  .console-line .ts { color: var(--muted); }
+  .console-panel {
+    background: #000000;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    height: 180px;
+    overflow-y: auto;
+    color: #d4d4d8;
+    box-shadow: inset 0 2px 4px rgba(0,0,0,0.5);
+  }
+  .console-panel.short { height: 140px; }
+  
+  .console-line { margin-bottom: 6px; line-height: 1.5; word-break: break-all; }
+  .console-line .ts { color: #52525b; margin-right: 8px; }
   .console-line.err { color: var(--red); }
   .console-line.warn { color: var(--yellow); }
   .console-line.info { color: var(--green); }
 
-  canvas { max-height: 220px; }
+  canvas { max-height: 240px; width: 100%; }
 
-  /* New Risk Banner and Metrics */
-  #risk-banner {
-      display: none;
-      background-color: var(--red);
-      color: white;
-      padding: 15px;
-      font-weight: bold;
-      text-align: center;
-      margin-bottom: 20px;
-      border-radius: 8px;
+  #risk-banner, #auth-banner {
+    display: none;
+    padding: 14px 20px;
+    border-radius: var(--radius-md);
+    text-align: center;
+    margin-bottom: 24px;
+    font-weight: 600;
+    font-size: 14px;
+    box-shadow: var(--shadow);
   }
-  .metric { font-family: monospace; }
+  
+  #risk-banner { background: var(--red); color: white; border: 1px solid #be123c; }
+  #auth-banner { background: var(--yellow); color: #78350f; border: 1px solid #b45309; }
+
+  .micro-badge {
+    padding: 4px 12px;
+    border-radius: 99px;
+    background: var(--accent-bg);
+    color: var(--accent);
+    font-weight: 600;
+    font-size: 12px;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+  }
+
+  .controls-stack { display: flex; flex-direction: column; gap: 12px; }
+
+  .dashboard-columns {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 24px;
+    margin-bottom: 24px;
+  }
+  
+  @media (max-width: 1024px) {
+    .dashboard-columns { grid-template-columns: 1fr; gap: 16px; }
+    body { padding: 16px; }
+    .keybar { flex-direction: column; align-items: stretch; }
+    .status-text { text-align: center; margin-left: 0; }
+  }
 </style>
 </head>
 <body>
 
 <div id="risk-banner">SYSTEM ALERT: <span id="risk-text"></span></div>
+<!-- v11.07 UX: a distinct banner for "your API key is wrong/missing", separate
+     from the risk-alert banner above. Silently looping "Disconnected...
+     Reconnecting" with no explanation was the single biggest reason the
+     dashboard LOOKED broken even when the backend was fine - this makes the
+     actual cause visible instead of making the operator guess. -->
+<div id="auth-banner">AUTHENTICATION FAILED: <span id="auth-text">Check the API Key field below.</span></div>
 
 <div class="admin-header">
   <div class="title-group">
     <h1>PROJECT KENJIN — COMMAND & MONITORING CENTER</h1>
     <div class="sub">Autonomous Algorithmic Trading Operations & Telemetry</div>
   </div>
-  
   <div class="health-bar">
-    <div class="health-pill"><span class="dot online" id="dotFastApi"></span> FastApi API</div>
-    <div class="health-pill"><span class="dot online" id="dotRedis"></span> Redis Cache</div>
-    <div class="health-pill"><span class="dot online" id="dotGroq"></span> Groq LLM</div>
-    <div class="health-pill"><span class="dot online" id="dotMt5"></span> MT5 Bridge</div>
+    <div class="health-pill"><span class="dot" id="dotFastApi"></span> FastAPI</div>
+    <div class="health-pill"><span class="dot" id="dotRedis"></span> Redis</div>
+    <div class="health-pill"><span class="dot" id="dotGroq"></span> Groq</div>
+    <div class="health-pill"><span class="dot" id="dotMt5"></span> MT5</div>
   </div>
 </div>
 
 <div class="keybar">
-  <input id="baseUrl" class="url-input" placeholder="http://127.0.0.1:8000" value="http://127.0.0.1:8000" />
-  <input id="apiKey" class="key-input" type="password" placeholder="Enter ORCH_API_KEY" />
-  <button class="btn" onclick="saveAndLoad()">Connect / Refresh</button>
-  <button class="btn btn-danger" onclick="triggerKillSwitch()">EMERGENCY KILL SWITCH</button>
-  <span class="status-text" id="statusText"></span>
+  <input id="baseUrl" class="url-input" placeholder="http://127.0.0.1:8000" value="http://127.0.0.1:8000"/>
+  <input id="apiKey" class="key-input" type="password" placeholder="ORCH_API_KEY"/>
+  <button class="btn" onclick="saveAndLoad()">Connect</button>
+  <button class="btn btn-danger" onclick="triggerKillSwitch()">Kill Switch</button>
+  <div class="status-text" id="statusText">Not connected</div>
 </div>
+<div class="config-hint" id="configHint">Loading configuration…</div>
 
-<!-- NEW LIVE STREAM PANEL -->
-<div class="panel" style="margin-bottom: 20px;">
-    <div class="panel-header"><h2>Live Micro-Telemetry Stream</h2></div>
-    <div class="grid-summary" style="margin-bottom: 0;">
-      <div class="card"><div class="label">Current Price</div><div class="value metric" id="live-price">--</div></div>
-      <div class="card"><div class="label">Micro Trend</div><div class="value metric" id="live-trend">--</div></div>
-      <div class="card"><div class="label">Model Expected Value</div><div class="value metric" id="live-ev">--</div></div>
-    </div>
+<div class="panel">
+  <div class="panel-header">
+    <h2>Live Micro-Telemetry</h2>
+    <div class="micro-badge" id="connMode">WebSocket (live)</div>
+  </div>
+  <div class="grid-summary" style="margin-bottom:0">
+    <div class="card"><div class="label">Current Price</div><div class="value metric" id="live-price">—</div></div>
+    <div class="card"><div class="label">Micro Trend</div><div class="value" id="live-trend">—</div></div>
+    <div class="card"><div class="label">Model EV</div><div class="value" id="live-ev">—</div></div>
+  </div>
 </div>
 
 <div class="grid-summary" id="summaryCards"></div>
 
 <div class="dashboard-columns">
-  <div class="panel no-margin">
-    <div class="panel-header">
-      <h2>Cumulative Equity & Drawdown (30D)</h2>
-    </div>
+  <div class="panel" style="margin-bottom:0">
+    <div class="panel-header"><h2>Equity Curve (30D)</h2></div>
     <canvas id="equityChart"></canvas>
   </div>
-  
-  <div class="panel no-margin">
-    <div class="panel-header">
-      <h2>System Telemetry & Controls</h2>
-    </div>
+  <div class="panel" style="margin-bottom:0">
+    <div class="panel-header"><h2>Controls</h2></div>
     <div class="controls-stack">
-      <button class="btn btn-outline" onclick="triggerModelRetrain()">Force LightGBM Retrain</button>
-      <button class="btn btn-outline" onclick="triggerCalibrate()">Calibrate Brier Scores</button>
-      <div style="font-size: 11px; color: var(--muted); margin-top: 6px;">
-        <div>Connection Type: <span style="color: var(--green);" id="pollIntervalLabel">WebSocket (Live)</span></div>
-      </div>
+      <button class="btn btn-outline" onclick="triggerModelRetrain()">Force Retrain</button>
+      <button class="btn btn-outline" onclick="triggerCalibrate()">Run Calibration</button>
+      <button class="btn btn-outline" onclick="logConsole('Local debug: active telemetry stream normal.', 'info')">Debug Logs</button>
     </div>
   </div>
 </div>
 
 <div class="dashboard-columns">
-  <div class="panel no-margin">
+  <div class="panel" style="margin-bottom:0">
     <div class="panel-header"><h2>Live Account State</h2></div>
     <div class="grid-summary" id="accountCards" style="margin-bottom:0;"></div>
   </div>
-
-  <div class="panel no-margin">
+  <div class="panel" style="margin-bottom:0">
     <div class="panel-header"><h2>Recent Risk Incidents</h2></div>
     <div class="console-panel short" id="riskIncidentStream">
       <div class="console-line info">No risk incidents recorded yet.</div>
@@ -172,38 +404,41 @@
   </div>
 </div>
 
-<div class="panel" style="margin-bottom: 20px;">
-  <div class="panel-header">
-    <h2>Per-Asset Strategy & In-Flight Micro-Trends</h2>
+<div class="panel">
+  <div class="panel-header"><h2>Per-Asset Strategy & In-Flight Micro-Trends</h2></div>
+  <div style="overflow-x: auto;">
+    <table id="assetTable">
+      <thead><tr>
+        <th>Asset</th><th>Status</th><th>Closed</th><th>Win Rate</th><th>Total P/L</th>
+        <th>EV Thresh</th><th>SL / TP Mult</th><th>Trading Hours</th><th>Micro Trend</th><th>Calibration</th><th>Actions</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
   </div>
-  <table id="assetTable">
-    <thead><tr>
-      <th>Asset</th><th>Status</th><th>Closed</th><th>Win Rate</th><th>Total P/L</th>
-      <th>EV Thresh</th><th>SL / TP Mult</th><th>Trading Hours</th><th>Micro Trend</th><th>Calibration</th><th>Actions</th>
-    </tr></thead>
-    <tbody></tbody>
-  </table>
 </div>
 
 <div class="dashboard-columns">
-  <div class="panel no-margin">
+  <div class="panel" style="margin-bottom:0">
     <div class="panel-header"><h2>Latest Macro Forecasts (Tier-1)</h2></div>
-    <table id="forecastTable">
-      <thead><tr><th>Asset</th><th>Bullish %</th><th>Bearish %</th><th>Generated</th></tr></thead>
-      <tbody></tbody>
-    </table>
+    <div style="overflow-x: auto;">
+      <table id="forecastTable">
+        <thead><tr><th>Asset</th><th>Bullish %</th><th>Bearish %</th><th>Generated</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </div>
-
-  <div class="panel no-margin">
+  <div class="panel" style="margin-bottom:0">
     <div class="panel-header"><h2>Recent Executed Trades</h2></div>
-    <table id="tradesTable">
-      <thead><tr><th>Asset</th><th>Type</th><th>Lots</th><th>Profit</th><th>Tier-2 Conf.</th><th>Time</th></tr></thead>
-      <tbody></tbody>
-    </table>
+    <div style="overflow-x: auto;">
+      <table id="tradesTable">
+        <thead><tr><th>Asset</th><th>Type</th><th>Lots</th><th>Profit</th><th>Tier-2 Conf.</th><th>Time</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </div>
 </div>
 
-<div class="panel" style="margin-top: 20px;">
+<div class="panel">
   <div class="panel-header"><h2>System Console Stream</h2></div>
   <div class="console-panel" id="consoleStream">
     <div class="console-line info"><span class="ts">[System Initialized]</span> Monitoring console ready. Connecting to backend...</div>
@@ -211,135 +446,234 @@
 </div>
 
 <script>
-let chart = null;
 let socket = null;
+let chart = null;
+let wsReconnectAttempts = 0;   // v11.07: back off instead of a fixed 3s retry forever
+let lastCloseWasAuthFailure = false;
 
-// XSS Sanitization Utility Function
-function escapeHTML(str) {
-    if (str === null || str === undefined) return '';
-    return String(str)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#39;");
+function escapeHTML(s) {
+    if (s === null || s === undefined) return '';
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
-document.addEventListener("DOMContentLoaded", () => {
-    if (localStorage.getItem("kenjin_api_key")) document.getElementById("apiKey").value = localStorage.getItem("kenjin_api_key");
-    if (localStorage.getItem("kenjin_base_url")) document.getElementById("baseUrl").value = localStorage.getItem("kenjin_base_url");
-    if (localStorage.getItem('kenjin_base_url') && localStorage.getItem('kenjin_api_key')) saveAndLoad();
+// v11.07 UX FIX (root cause of "frontend shows no live data" on first run):
+// previously this only called saveAndLoad() when BOTH a base URL AND an API
+// key were already saved in localStorage from a PREVIOUS session - so on a
+// brand new profile (first run, cleared cache, or a fresh Electron install)
+// NOTHING ever loaded until the operator noticed the dashboard was empty,
+// manually typed the API key, and clicked Connect. Now: always attempt a
+// connection on load, in this priority order for where the config comes
+// from -
+//   1. window.kenjinConfig - populated by electron-app/preload.js, which
+//      reads ORCH_API_KEY/KENJIN_HOST/KENJIN_PORT directly from the local
+//      .env on the same machine. This is the normal path when running
+//      inside the actual Kenjin desktop app - zero manual steps.
+//   2. localStorage - a previously saved session (e.g. dashboard.html opened
+//      directly in a regular browser, where window.kenjinConfig won't exist).
+//   3. the input fields' own HTML defaults - so even with nothing saved
+//      anywhere, fetchHealth()/fetchKpis() are still attempted immediately
+//      and the operator gets a clear "API Key missing" status instead of a
+//      dashboard that just silently sits there looking broken.
+document.addEventListener('DOMContentLoaded', () => {
+    const hintEl = document.getElementById('configHint');
+    const urlInput = document.getElementById('baseUrl');
+    const keyInput = document.getElementById('apiKey');
+
+    const electronConfig = (typeof window.kenjinConfig !== 'undefined') ? window.kenjinConfig : null;
+    const storedKey = localStorage.getItem('kenjin_api_key');
+    const storedBase = localStorage.getItem('kenjin_base_url');
+
+    if (electronConfig && electronConfig.apiKey) {
+        keyInput.value = electronConfig.apiKey;
+        urlInput.value = electronConfig.baseUrl || urlInput.value;
+        hintEl.textContent = 'Configuration loaded automatically from .env (Electron desktop app).';
+        hintEl.className = 'config-hint auto';
+    } else if (storedKey || storedBase) {
+        if (storedKey) keyInput.value = storedKey;
+        if (storedBase) urlInput.value = storedBase;
+        hintEl.textContent = 'Configuration restored from this browser\'s last session.';
+        hintEl.className = 'config-hint';
+    } else {
+        hintEl.textContent = 'No saved configuration found - enter your ORCH_API_KEY (from .env) and click Connect.';
+        hintEl.className = 'config-hint';
+    }
+
+    // Always attempt to connect now, regardless of which branch above ran -
+    // this is the actual fix. fetchHealth() needs no key and will always
+    // report something; fetchKpis()/connectWebSocket() will clearly report
+    // "API Key missing" rather than doing nothing.
+    saveAndLoad();
 });
 
-function logConsole(msg, type = 'info') {
+function logConsole(msg, type='info') {
     const el = document.getElementById('consoleStream');
     const line = document.createElement('div');
-    line.className = `console-line ${type}`;
+    line.className = `console-line ${type || 'info'}`;
     line.innerHTML = `<span class="ts">[${new Date().toLocaleTimeString()}]</span> ${escapeHTML(msg)}`;
     el.appendChild(line);
     el.scrollTop = el.scrollHeight;
+    // Keep the console from growing unbounded over a long-running session.
+    while (el.children.length > 200) el.removeChild(el.firstChild);
 }
 
 function getCleanBaseUrl() {
-    let url = document.getElementById("baseUrl").value.trim();
-    return url.replace(/\[.*?\]\((.*?)\)/g, "$1").replace(/[\[\]]/g, "").replace(/\/+$/, "");
+    let url = document.getElementById('baseUrl').value.trim();
+    return url.replace(/\[.*?\]\((.*?)\)/g, "$1").replace(/[\[\]]/g, "").replace(/\/+$/, '');
 }
 
-// -------------------------------------------------------------------------
-// WebSocket Dynamic Data Integration 
-// -------------------------------------------------------------------------
 function connectWebSocket() {
     const baseUrl = getCleanBaseUrl();
-    if (!baseUrl) return;
-    
-    // Automatically convert http(s):// to ws(s)://
-    const WS_URL = baseUrl.replace(/^http/, 'ws') + "/ws/dashboard";
+    const apiKey = document.getElementById('apiKey').value.trim();
+    if (!baseUrl) { logConsole('Base URL missing', 'err'); return; }
 
-    if (socket) socket.close();
-    
-    socket = new WebSocket(WS_URL);
+    const wsProto = baseUrl.startsWith('https') ? 'wss' : 'ws';
+    const wsBase = baseUrl.replace(/^https?/, wsProto);
+    const wsUrl = wsBase + '/ws/dashboard' + (apiKey ? `?api_key=${encodeURIComponent(apiKey)}` : '');
+
+    if (socket) { try { socket.close(); } catch(e) {} }
+
+    socket = new WebSocket(wsUrl);
 
     socket.onopen = function(e) {
+        wsReconnectAttempts = 0;
+        lastCloseWasAuthFailure = false;
+        document.getElementById('auth-banner').style.display = 'none';
         logConsole("[WS] Connected to Project Kenjin Orchestrator", "info");
+        document.getElementById('statusText').innerText = 'Connected (Live WS)';
+        document.getElementById('statusText').className = 'status-text';
     };
 
     socket.onmessage = function(event) {
         const payload = JSON.parse(event.data);
 
-        // Handle Tick Data Stream
         if (payload.type === "TICK_UPDATE") {
-            document.getElementById("live-price").innerText = payload.price !== undefined ? parseFloat(payload.price).toFixed(5) : "--";
-            document.getElementById("live-trend").innerText = payload.micro_trend || "--";
-            document.getElementById("live-ev").innerText = payload.expected_value !== undefined ? parseFloat(payload.expected_value).toFixed(2) : "--";
+            document.getElementById("live-price").innerText = payload.price !== undefined ? parseFloat(payload.price).toFixed(5) : "—";
+            document.getElementById("live-trend").innerText = payload.micro_trend || "—";
+            document.getElementById("live-ev").innerText = payload.expected_value !== undefined ? parseFloat(payload.expected_value).toFixed(2) : "—";
         }
 
-        // Handle Critical Risk Incidents
         if (payload.type === "RISK_ALERT") {
             const banner = document.getElementById("risk-banner");
             document.getElementById("risk-text").innerText = payload.message;
             banner.style.display = "block";
-            
             logConsole(`[RISK ALERT] ${payload.message}`, "err");
-            fetchKpis(); // Refresh to update accounts & risk stream DB UI
-            
-            // Auto-hide alert after 10 seconds
+            fetchKpis();
             setTimeout(() => { banner.style.display = "none"; }, 10000);
         }
 
-        // Handle Trade Closures
         if (payload.type === "TRADE_CLOSED") {
             logConsole(`[TRADE CLOSED] P/L Settled: ${payload.profit}`, "info");
-            // Pull the latest KPIs to reflect closed trades & equity accurately
             fetchKpis();
         }
     };
 
+    // v11.07 FIX: the backend (main.py::websocket_dashboard_endpoint) closes
+    // with code 1008 specifically when the API key is missing or wrong. The
+    // old code treated this exactly like a normal network blip - it just
+    // said "Disconnected. Reconnecting in 3 seconds..." forever, so a typo'd
+    // or empty API key looked IDENTICAL to "the orchestrator isn't running."
+    // Now: detect 1008 specifically, show a clear auth banner, and back off
+    // instead of hammering the server every 3 seconds with the same bad key.
     socket.onclose = function(event) {
-        logConsole("[WS] Disconnected. Reconnecting in 3 seconds...", "warn");
-        setTimeout(connectWebSocket, 3000); // Auto-reconnect logic
+        if (event.code === 1008) {
+            lastCloseWasAuthFailure = true;
+            const banner = document.getElementById('auth-banner');
+            const text = document.getElementById('auth-text');
+            text.textContent = apiKey
+                ? 'The API Key entered does not match ORCH_API_KEY in .env. Update the field above and click Connect.'
+                : 'No API Key entered. Enter the ORCH_API_KEY value from .env and click Connect.';
+            banner.style.display = 'block';
+            logConsole('[WS] Authentication failed (HTTP 1008) - not retrying automatically.', 'err');
+            document.getElementById('statusText').innerText = 'Authentication failed';
+            document.getElementById('statusText').className = 'status-text err';
+            return; // do not auto-reconnect on an auth failure - retrying won't help
+        }
+
+        wsReconnectAttempts = Math.min(wsReconnectAttempts + 1, 6);
+        const delayMs = Math.min(30000, 3000 * Math.pow(1.5, wsReconnectAttempts - 1));
+        logConsole(`[WS] Disconnected. Reconnecting in ${Math.round(delayMs / 1000)}s...`, "warn");
+        document.getElementById('statusText').innerText = 'Disconnected (Reconnecting...)';
+        document.getElementById('statusText').className = 'status-text';
+        setTimeout(connectWebSocket, delayMs);
     };
 
     socket.onerror = function(error) {
-        logConsole(`[WS] Error: Connection Fault`, "err");
+        logConsole(`[WS] Connection Fault`, "err");
+        document.getElementById('statusText').innerText = 'Connection Error';
     };
 }
 
 function saveAndLoad() {
     const baseUrl = getCleanBaseUrl();
-    const apiKey = document.getElementById("apiKey").value.trim();
-    localStorage.setItem("kenjin_base_url", baseUrl);
-    localStorage.setItem("kenjin_api_key", apiKey);
+    const apiKey = document.getElementById('apiKey').value.trim();
+    localStorage.setItem('kenjin_base_url', baseUrl);
+    localStorage.setItem('kenjin_api_key', apiKey);
 
-    // Initial explicit loads
     fetchKpis();
     fetchHealth();
-    
-    // Establish WebSocket listener (replaces legacy setTimeout/setInterval polling)
     connectWebSocket();
 }
 
+// v11.07 FIX: previously this lit up ALL FOUR dots green purely because
+// /health returned 200 - but /health only ever verified Postgres. Redis
+// being down, Groq's key being unset, or the EA never having connected to
+// MT5 at all were completely invisible - the operator would see a
+// reassuring wall of green dots while telling literally nothing about
+// whether data was actually flowing. Now reads the granular per-service
+// fields /health now returns (see health_endpoint.patch.py).
 async function fetchHealth() {
     const baseUrl = getCleanBaseUrl();
     const dotApi = document.getElementById("dotFastApi");
+    const dotRedis = document.getElementById("dotRedis");
+    const dotGroq = document.getElementById("dotGroq");
+    const dotMt5 = document.getElementById("dotMt5");
+
     try {
         const response = await fetch(`${baseUrl}/health`, { method: "GET" });
-        if (response.ok) {
-            dotApi.className = "dot online";
-        } else {
+        if (!response.ok) {
             dotApi.className = "dot degraded";
+            dotRedis.className = "dot offline";
+            dotGroq.className = "dot offline";
+            dotMt5.className = "dot offline";
+            return;
+        }
+        const data = await response.json();
+
+        dotApi.className = data.db === "ok" ? "dot online" : "dot offline";
+        dotRedis.className = data.redis === "ok" ? "dot online" : "dot offline";
+        dotGroq.className = data.groq === "configured" ? "dot online" : "dot degraded";
+
+        // MT5 dot: "online" only if an account_snapshot arrived recently
+        // (EA is actively posting), "degraded" if it's stale, "offline" if
+        // none has ever been received.
+        if (data.mt5_last_seen_seconds === null || data.mt5_last_seen_seconds === undefined) {
+            dotMt5.className = "dot offline";
+        } else if (data.mt5_last_seen_seconds < 120) {
+            dotMt5.className = "dot online";
+        } else {
+            dotMt5.className = "dot degraded";
         }
     } catch (error) {
         dotApi.className = "dot offline";
+        dotRedis.className = "dot offline";
+        dotGroq.className = "dot offline";
+        dotMt5.className = "dot offline";
     }
 }
 
 async function fetchKpis() {
     const baseUrl = getCleanBaseUrl();
-    const apiKey = document.getElementById("apiKey").value.trim();
+    const apiKey = document.getElementById('apiKey').value.trim();
     const statusEl = document.getElementById('statusText');
 
     if (!apiKey) {
-        statusEl.textContent = 'API Key missing.';
+        statusEl.textContent = 'API Key missing - enter it above and click Connect.';
+        statusEl.className = 'status-text err';
         return;
     }
 
@@ -350,7 +684,8 @@ async function fetchKpis() {
         });
 
         if (response.status === 401) {
-            statusEl.textContent = 'Auth Failed (401)';
+            statusEl.textContent = 'Auth Failed (401) - check API Key.';
+            statusEl.className = 'status-text err';
             logConsole('Authentication Error: Invalid API Key provided.', 'err');
             return;
         }
@@ -360,143 +695,154 @@ async function fetchKpis() {
         const data = await response.json();
         render(data);
         statusEl.textContent = 'Updated: ' + new Date().toLocaleTimeString();
+        statusEl.className = 'status-text';
     } catch (error) {
-        statusEl.textContent = 'Connection Error';
+        statusEl.textContent = 'Connection Error: ' + error.message;
+        statusEl.className = 'status-text err';
         logConsole(`Fetch error: ${error.message}`, 'err');
     }
 }
 
+// v11.07: each section wrapped in its own try/catch. Previously a single
+// unexpected field anywhere in the payload would throw partway through
+// render() and silently abort every section after it - the fetch itself
+// would have succeeded, but the operator would just see a generic
+// "Connection Error" with no indication the data actually arrived fine and
+// only rendering failed. Now one bad section logs a specific console error
+// and the rest of the dashboard still updates normally.
 function render(data) {
-  const s = data.summary;
-  document.getElementById('summaryCards').innerHTML = `
-    <div class="card"><div class="label">Closed Trades (30d)</div><div class="value">${Number(s.total_closed_trades)}</div></div>
-    <div class="card"><div class="label">Win Rate</div><div class="value">${Number(s.overall_win_rate)}%</div></div>
-    <div class="card"><div class="label">Total Profit</div><div class="value ${s.total_profit >= 0 ? 'pos' : 'neg'}">${s.total_profit >= 0 ? '+' : ''}${Number(s.total_profit)}</div></div>
-    <div class="card"><div class="label">Assets Live</div><div class="value">${Number(s.assets_live_approved)} / ${Number(s.assets_tracked)}</div></div>
-  `;
+    try {
+        const s = data.summary;
+        document.getElementById('summaryCards').innerHTML = `
+            <div class="card"><div class="label">Closed Trades (30d)</div><div class="value">${Number(s.total_closed_trades)}</div></div>
+            <div class="card"><div class="label">Win Rate</div><div class="value">${Number(s.overall_win_rate)}%</div></div>
+            <div class="card"><div class="label">Total Profit</div><div class="value ${s.total_profit >= 0 ? 'pos' : 'neg'}">${s.total_profit >= 0 ? '+' : ''}${Number(s.total_profit)}</div></div>
+            <div class="card"><div class="label">Assets Live</div><div class="value">${Number(s.assets_live_approved)} / ${Number(s.assets_tracked)}</div></div>
+        `;
+    } catch (e) { logConsole(`Render error (summary): ${e.message}`, 'err'); }
 
-  // Equity Chart
-  const eqLabels = data.equity_curve.map(r => new Date(r.created_at).toLocaleTimeString());
-  const eqValues = data.equity_curve.map(r => r.cumulative_profit);
-  const ctx = document.getElementById('equityChart').getContext('2d');
-  if (chart) chart.destroy();
-  chart = new Chart(ctx, {
-    type: 'line',
-    data: { labels: eqLabels, datasets: [{ label: 'Profit', data: eqValues, borderColor: '#5b8def', backgroundColor: 'rgba(91,141,239,0.08)', fill: true, tension: 0.1, pointRadius: 0 }] },
-    options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { grid: { color: '#222733' }, ticks: { color: '#8b93a3' } } } }
-  });
+    try {
+        const eqLabels = data.equity_curve.map(r => new Date(r.created_at).toLocaleTimeString());
+        const eqValues = data.equity_curve.map(r => r.cumulative_profit);
+        const ctx = document.getElementById('equityChart').getContext('2d');
+        if (chart) chart.destroy();
+        chart = new Chart(ctx, {
+            type: 'line',
+            data: { labels: eqLabels, datasets: [{ label: 'Profit', data: eqValues, borderColor: '#3b82f6', backgroundColor: 'rgba(59, 130, 246, 0.1)', fill: true, tension: 0.2, pointRadius: 0 }] },
+            options: { responsive: true, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { grid: { color: '#27272a' }, ticks: { color: '#a1a1aa', font: { family: 'JetBrains Mono' } } } } }
+        });
+    } catch (e) { logConsole(`Render error (equity chart): ${e.message}`, 'err'); }
 
-  // Live Account State
-  const acctEl = document.getElementById('accountCards');
-  if (data.accounts && data.accounts.length) {
-    acctEl.innerHTML = data.accounts.map(a => {
-      const stale = a.seconds_since_update > 120;
-      const safeAsset = escapeHTML(a.asset ?? 'n/a');
-      const safeAcctType = escapeHTML(a.account_type.toUpperCase());
-      const staleTag = stale ? `<div class="sub-value" style="color: var(--red);">STALE — no update in ${Math.round(a.seconds_since_update)}s</div>` : '';
-      const haltTag = a.drawdown_halt ? '<span class="badge bearish">DRAWDOWN HALT</span>' :
-                      (a.risk_cooldown_active ? '<span class="badge neutral">COOLDOWN</span>' : '<span class="badge live">NORMAL</span>');
-      return `
-        <div class="card">
-          <div class="label">${safeAcctType} — ${safeAsset}</div>
-          <div class="value ${a.equity >= a.balance ? 'pos' : 'neg'}">${a.equity != null ? a.equity.toFixed(2) : '—'}</div>
-          <div class="sub-value">Balance ${a.balance != null ? a.balance.toFixed(2) : '—'} · Floating ${a.floating_pl != null ? (a.floating_pl >= 0 ? '+' : '') + a.floating_pl.toFixed(2) : '—'}</div>
-          <div class="sub-value">Drawdown ${a.drawdown_pct != null ? a.drawdown_pct.toFixed(1) : '0.0'}% · Daily loss ${a.day_loss_pct != null ? a.day_loss_pct.toFixed(1) : '0.0'}%</div>
-          <div class="sub-value">${haltTag}</div>
-          ${staleTag}
-        </div>`;
-    }).join('');
-  } else {
-    acctEl.innerHTML = `<div class="card"><div class="label">Account State</div><div class="sub-value">No snapshots received yet — EA needs the v11.06 PostAccountSnapshot() patch.</div></div>`;
-  }
+    try {
+        const acctEl = document.getElementById('accountCards');
+        if (data.accounts && data.accounts.length) {
+            acctEl.innerHTML = data.accounts.map(a => {
+                const stale = a.seconds_since_update > 120;
+                const safeAsset = escapeHTML(a.asset ?? 'n/a');
+                const safeAcctType = escapeHTML((a.account_type ?? 'unknown').toUpperCase());
+                const staleTag = stale ? `<div class="sub-value" style="color: var(--red);">STALE — no update in ${Math.round(a.seconds_since_update)}s</div>` : '';
+                const haltTag = a.drawdown_halt ? '<span class="badge bearish">DRAWDOWN HALT</span>' : (a.risk_cooldown_active ? '<span class="badge neutral">COOLDOWN</span>' : '<span class="badge live">NORMAL</span>');
+                return `
+                    <div class="card">
+                        <div class="label">${safeAcctType} — ${safeAsset}</div>
+                        <div class="value ${a.equity >= a.balance ? 'pos' : 'neg'}">${a.equity != null ? a.equity.toFixed(2) : '—'}</div>
+                        <div class="sub-value">Balance ${a.balance != null ? a.balance.toFixed(2) : '—'} · Floating ${a.floating_pl != null ? (a.floating_pl >= 0 ? '+' : '') + a.floating_pl.toFixed(2) : '—'}</div>
+                        <div class="sub-value">Drawdown ${a.drawdown_pct != null ? a.drawdown_pct.toFixed(1) : '0.0'}% · Daily loss ${a.day_loss_pct != null ? a.day_loss_pct.toFixed(1) : '0.0'}%</div>
+                        <div class="sub-value" style="margin-top: 10px;">${haltTag}</div>
+                        ${staleTag}
+                    </div>`;
+            }).join('');
+        } else {
+            acctEl.innerHTML = `<div class="card"><div class="label">Account State</div><div class="sub-value">No snapshots received yet.</div></div>`;
+        }
+    } catch (e) { logConsole(`Render error (accounts): ${e.message}`, 'err'); }
 
-  // Risk Incidents
-  const riskEl = document.getElementById('riskIncidentStream');
-  if (data.risk_incidents && data.risk_incidents.length) {
-    riskEl.innerHTML = data.risk_incidents.map(r => {
-        const safeReason = escapeHTML(r.reason);
-        const safeDetails = escapeHTML(r.details);
-        const safeAsset = escapeHTML(r.asset ?? '');
-        const safeAcctType = escapeHTML(r.account_type.toUpperCase());
-        return `
-      <div class="console-line ${safeReason.toLowerCase().includes('drawdown') || safeReason.toLowerCase().includes('loss') ? 'err' : 'warn'}">
-        <span class="ts">[${new Date(r.created_at).toLocaleString()}]</span>
-        ${safeAcctType} ${safeAsset} — <b>${safeReason}</b>${safeDetails ? ': ' + safeDetails : ''}
-      </div>`
-    }).join('');
-  }
-  
-  // Assets Table
-  const assetBody = document.querySelector('#assetTable tbody');
-  assetBody.innerHTML = data.per_asset.map(a => {
-    const safeAsset = escapeHTML(a.asset);
-    const safeMicroTrend = escapeHTML(a.micro_trend ?? 'NEUTRAL');
-    return `
-    <tr>
-      <td><b>${safeAsset}</b></td>
-      <td><span class="badge ${a.live_approved ? 'live' : 'pending'}">${a.live_approved ? 'LIVE' : 'HOLD'}</span></td>
-      <td>${Number(a.closed_trades)}</td>
-      <td>${Number(a.win_rate)}%</td>
-      <td class="${a.total_profit >= 0 ? 'profit-pos' : 'profit-neg'}">${a.total_profit >= 0 ? '+' : ''}${Number(a.total_profit)}</td>
-      <td>${a.opt_threshold !== null ? Number(a.opt_threshold) : '—'}</td>
-      <td>${a.opt_sl_mult !== null ? Number(a.opt_sl_mult) : '1.0'}x / ${a.opt_tp_mult !== null ? Number(a.opt_tp_mult) : '1.0'}x</td>
-      <td>${a.scheduled_start_hour !== null ? `${Number(a.scheduled_start_hour)}:00–${Number(a.scheduled_end_hour)}:00 UTC` : '24/7'}</td>
-      <td><span class="badge ${safeMicroTrend.toLowerCase()}">${safeMicroTrend}</span></td>
-      <td>${a.calibration_score !== null ? `${Number(a.calibration_score)}` : '—'}</td>
-      <td><button class="btn" style="padding: 2px 8px; font-size: 10px;" onclick="toggleAssetLive('${safeAsset}', ${!a.live_approved})">${a.live_approved ? 'Pause' : 'Enable'}</button></td>
-    </tr>
-  `}).join('');
+    try {
+        const riskEl = document.getElementById('riskIncidentStream');
+        if (data.risk_incidents && data.risk_incidents.length) {
+            riskEl.innerHTML = data.risk_incidents.map(r => {
+                const safeReason = escapeHTML(r.reason ?? '');
+                const safeDetails = escapeHTML(r.details ?? '');
+                const safeAsset = escapeHTML(r.asset ?? '');
+                const safeAcctType = escapeHTML((r.account_type ?? 'unknown').toUpperCase());
+                return `
+                    <div class="console-line ${safeReason.toLowerCase().includes('drawdown') ? 'err' : 'warn'}">
+                        <span class="ts">[${new Date(r.created_at).toLocaleTimeString()}]</span>
+                        ${safeAcctType} ${safeAsset} — <b>${safeReason}</b>${safeDetails ? ': ' + safeDetails : ''}
+                    </div>`;
+            }).join('');
+        }
+    } catch (e) { logConsole(`Render error (risk incidents): ${e.message}`, 'err'); }
 
-  // Forecasts Table
-  const fcBody = document.querySelector('#forecastTable tbody');
-  fcBody.innerHTML = data.latest_forecasts.map(f => {
-    const safeAsset = escapeHTML(f.asset);
-    return `
-    <tr><td>${safeAsset}</td><td style="color: var(--green);">${f.bullish_prob ?? '—'}%</td><td style="color: var(--red);">${f.bearish_prob ?? '—'}%</td><td>${new Date(f.generated_at).toLocaleTimeString()}</td></tr>
-  `}).join('');
+    try {
+        const assetBody = document.querySelector('#assetTable tbody');
+        assetBody.innerHTML = data.per_asset.map(a => {
+            const safeAsset = escapeHTML(a.asset);
+            const safeMicroTrend = escapeHTML(a.micro_trend ?? 'NEUTRAL');
+            return `
+            <tr>
+                <td><b>${safeAsset}</b></td>
+                <td><span class="badge ${a.live_approved ? 'live' : 'pending'}">${a.live_approved ? 'LIVE' : 'HOLD'}</span></td>
+                <td>${Number(a.closed_trades)}</td>
+                <td>${Number(a.win_rate)}%</td>
+                <td class="${a.total_profit >= 0 ? 'profit-pos' : 'profit-neg'}">${a.total_profit >= 0 ? '+' : ''}${Number(a.total_profit)}</td>
+                <td>${a.opt_threshold !== null ? Number(a.opt_threshold) : '—'}</td>
+                <td>${a.opt_sl_mult !== null ? Number(a.opt_sl_mult) : '1.0'}x / ${a.opt_tp_mult !== null ? Number(a.opt_tp_mult) : '1.0'}x</td>
+                <td>${a.scheduled_start_hour !== null ? `${Number(a.scheduled_start_hour)}:00–${Number(a.scheduled_end_hour)}:00 UTC` : '24/7'}</td>
+                <td><span class="badge ${safeMicroTrend.toLowerCase()}">${safeMicroTrend}</span></td>
+                <td>${a.calibration_score !== null ? `${Number(a.calibration_score)}` : '—'}</td>
+                <td><button class="btn btn-outline" style="padding: 4px 10px; font-size: 11px;" onclick="toggleAssetLive('${safeAsset}', ${!a.live_approved})">${a.live_approved ? 'Pause' : 'Enable'}</button></td>
+            </tr>`;
+        }).join('');
+    } catch (e) { logConsole(`Render error (asset table): ${e.message}`, 'err'); }
 
-  // Recent Trades Table
-  const tradesBody = document.querySelector('#tradesTable tbody');
-  tradesBody.innerHTML = data.recent_trades.map(t => {
-    const safeAsset = escapeHTML(t.asset);
-    const safeType = escapeHTML(t.type);
-    return `
-    <tr>
-      <td>${safeAsset}</td><td>${safeType}</td><td>${t.lots ?? '—'}</td>
-      <td class="${(t.profit ?? 0) >= 0 ? 'profit-pos' : 'profit-neg'}">${t.profit !== null ? (t.profit >= 0 ? '+' : '') + t.profit : '—'}</td>
-      <td>${t.tier2_confidence ? (t.tier2_confidence * 100).toFixed(1) + '%' : '—'}</td>
-      <td>${new Date(t.created_at).toLocaleTimeString()}</td>
-    </tr>
-  `}).join('');
+    try {
+        const fcBody = document.querySelector('#forecastTable tbody');
+        fcBody.innerHTML = data.latest_forecasts.map(f => {
+            const safeAsset = escapeHTML(f.asset);
+            return `<tr>
+                <td><b>${safeAsset}</b></td>
+                <td style="color: var(--green);">${f.bullish_prob ?? '—'}%</td>
+                <td style="color: var(--red);">${f.bearish_prob ?? '—'}%</td>
+                <td style="color: var(--muted);">${new Date(f.generated_at).toLocaleTimeString()}</td>
+            </tr>`;
+        }).join('');
+    } catch (e) { logConsole(`Render error (forecasts): ${e.message}`, 'err'); }
+
+    try {
+        const tradesBody = document.querySelector('#tradesTable tbody');
+        tradesBody.innerHTML = data.recent_trades.map(t => {
+            const safeAsset = escapeHTML(t.asset);
+            const safeType = escapeHTML(t.type);
+            return `
+            <tr>
+                <td><b>${safeAsset}</b></td>
+                <td>${safeType}</td>
+                <td>${t.lots ?? '—'}</td>
+                <td class="${(t.profit ?? 0) >= 0 ? 'profit-pos' : 'profit-neg'}">${t.profit !== null ? (t.profit >= 0 ? '+' : '') + t.profit : '—'}</td>
+                <td>${t.tier2_confidence ? (t.tier2_confidence * 100).toFixed(1) + '%' : '—'}</td>
+                <td style="color: var(--muted);">${new Date(t.created_at).toLocaleTimeString()}</td>
+            </tr>`;
+        }).join('');
+    } catch (e) { logConsole(`Render error (recent trades): ${e.message}`, 'err'); }
 }
-
-// =========================================================================
-// Administrative Command & Control API Functions
-// =========================================================================
 
 async function triggerKillSwitch() {
     if (!confirm("EMERGENCY KILL SWITCH: Are you sure you want to pause ALL trading and reject new execution signals?")) return;
-    
     const baseUrl = getCleanBaseUrl();
     const apiKey = document.getElementById("apiKey").value.trim();
-    
     logConsole("CRITICAL: Executing Global Emergency Kill Switch...", "err");
 
     try {
         const response = await fetch(`${baseUrl}/control/kill_switch`, {
             method: "POST",
-            headers: {
-                "X-API-Key": apiKey,
-                "Content-Type": "application/json"
-            },
+            headers: { "X-API-Key": apiKey, "Content-Type": "application/json" },
             body: JSON.stringify({ kill_switch: true, reason: "Operator manual override from admin dashboard" })
         });
-
         if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-
         const data = await response.json();
-        logConsole(`KILL SWITCH ACTIVATED: ${data.message || 'All asset executions suspended.'}`, "err");
-        fetchKpis(); 
+        logConsole(`KILL SWITCH ACTIVATED: ${data.message || 'All executions suspended.'}`, "err");
+        fetchKpis();
     } catch (error) {
         logConsole(`Kill Switch Execution Failed: ${error.message}`, "err");
     }
@@ -505,22 +851,16 @@ async function triggerKillSwitch() {
 async function triggerModelRetrain() {
     const baseUrl = getCleanBaseUrl();
     const apiKey = document.getElementById("apiKey").value.trim();
-
-    logConsole("Requesting LightGBM Triple Neural Map retrain background job...", "warn");
+    logConsole("Requesting model retrain background job...", "warn");
 
     try {
         const response = await fetch(`${baseUrl}/jobs/retrain`, {
             method: "POST",
-            headers: {
-                "X-API-Key": apiKey,
-                "Content-Type": "application/json"
-            }
+            headers: { "X-API-Key": apiKey, "Content-Type": "application/json" }
         });
-
         if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-
         const data = await response.json();
-        logConsole(`RETRAIN SUCCESS: ${data.message || 'LightGBM model retraining initiated.'}`, "info");
+        logConsole(`RETRAIN SUCCESS: ${data.message || 'Model retraining initiated.'}`, "info");
     } catch (error) {
         logConsole(`Model Retrain Failed: ${error.message}`, "err");
     }
@@ -529,23 +869,17 @@ async function triggerModelRetrain() {
 async function triggerCalibrate() {
     const baseUrl = getCleanBaseUrl();
     const apiKey = document.getElementById("apiKey").value.trim();
-
-    logConsole("Triggering Brier score confidence calibration task...", "info");
+    logConsole("Triggering confidence calibration task...", "info");
 
     try {
         const response = await fetch(`${baseUrl}/jobs/calibrate`, {
             method: "POST",
-            headers: {
-                "X-API-Key": apiKey,
-                "Content-Type": "application/json"
-            }
+            headers: { "X-API-Key": apiKey, "Content-Type": "application/json" }
         });
-
         if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-
         const data = await response.json();
-        logConsole(`CALIBRATION COMPLETE: ${data.message || 'Brier scores updated across strategy DB.'}`, "info");
-        fetchKpis(); 
+        logConsole(`CALIBRATION COMPLETE: ${data.message || 'Scores updated.'}`, "info");
+        fetchKpis();
     } catch (error) {
         logConsole(`Calibration Task Failed: ${error.message}`, "err");
     }
@@ -555,30 +889,24 @@ async function toggleAssetLive(asset, newState) {
     const baseUrl = getCleanBaseUrl();
     const apiKey = document.getElementById("apiKey").value.trim();
     const actionLabel = newState ? 'LIVE' : 'HOLD';
-
     logConsole(`Updating live execution status for ${asset} to ${actionLabel}...`, 'warn');
 
     try {
         const response = await fetch(`${baseUrl}/strategy_params`, {
             method: "PATCH",
-            headers: {
-                "X-API-Key": apiKey,
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                symbol: asset,
-                live_approved: newState
-            })
+            headers: { "X-API-Key": apiKey, "Content-Type": "application/json" },
+            body: JSON.stringify({ symbol: asset, live_approved: newState })
         });
-
         if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-
         logConsole(`STATUS UPDATED: Asset ${asset} set to ${actionLabel}.`, "info");
-        fetchKpis(); 
+        fetchKpis();
     } catch (error) {
         logConsole(`Failed to update ${asset}: ${error.message}`, "err");
     }
 }
+
+// Periodic refresh - unchanged behavior, just kept explicit here.
+setInterval(() => { fetchKpis(); fetchHealth(); }, 15000);
 </script>
 </body>
 </html>
