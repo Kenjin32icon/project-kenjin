@@ -3,6 +3,21 @@
 # start_kenjin.sh — Complete launcher for Project Kenjin Orchestrator,
 # FBS MT5 (via Wine) & Electron Frontend App.
 #
+# DO NOT hardcode a specific username, WINEPREFIX, or Wine binary (e.g.
+# /home/infoscience/.wine-kenjin, wine-stable) into the ": ${VAR:=...}"
+# defaults below - a prior revision of this script did exactly that and it
+# silently breaks on every machine that isn't the one it was written on:
+#   - a fallback WINE_BIN of "wine-stable" fails with "command not found"
+#     unless that exact binary name was installed (the standard `sudo apt
+#     install wine` package installs a binary named `wine`, not
+#     `wine-stable` - that name normally only exists if you added the
+#     WineHQ repo and installed its staging/stable split packages).
+#   - a fallback WINEPREFIX/MT5_SHORTCUT_PATH under another user's $HOME
+#     silently launches nothing (or the wrong install) for everyone else.
+# Always set WINEPREFIX / WINE_BIN / MT5_SHORTCUT_PATH in .env instead -
+# these ":=" defaults exist only so the script doesn't hard-fail when .env
+# is momentarily incomplete during first-time setup.
+#
 # CHANGES FROM v1:
 #   - No more hardcoded /home/infoscience paths - everything is read from
 #     .env or sane defaults, so this runs on any Linux Mint account.
@@ -101,23 +116,67 @@ if [ "$USE_CONDA" = "1" ]; then
         conda env create -f "$ROOT_DIR/environment.yml"
     fi
     conda activate "$CONDA_ENV_NAME"
+
+    # Same staleness problem as the venv path below, just for conda: an
+    # env that already existed from before environment.yml changed never
+    # otherwise picks up the change. Hash-gate an `env update` so this stays
+    # fast on unchanged runs instead of re-solving every launch.
+    ENV_HASH_FILE="$(conda info --base)/envs/${CONDA_ENV_NAME}/.environment.sha256"
+    NEW_ENV_HASH="$(sha256sum "$ROOT_DIR/environment.yml" 2>/dev/null | awk '{print $1}')"
+    OLD_ENV_HASH="$(cat "$ENV_HASH_FILE" 2>/dev/null || echo "")"
+    if [ "$NEW_ENV_HASH" != "$OLD_ENV_HASH" ]; then
+        echo "==> environment.yml changed since last run - updating '${CONDA_ENV_NAME}'..."
+        conda env update -f "$ROOT_DIR/environment.yml" --prune
+        echo "$NEW_ENV_HASH" > "$ENV_HASH_FILE"
+    fi
     echo "==> Using Miniconda environment: $CONDA_ENV_NAME ($(which python))"
 else
     VENV_PATH="orchestrator/.venv"
     if [ ! -d "$VENV_PATH" ]; then
         echo "==> Creating Python virtual environment at $VENV_PATH..."
         python3 -m venv "$VENV_PATH"
-        # shellcheck disable=SC1091
-        source "$VENV_PATH/bin/activate"
-        pip install --upgrade pip
-        if [ -f "orchestrator/requirements.txt" ]; then
-            pip install -r orchestrator/requirements.txt
-        fi
-    else
-        # shellcheck disable=SC1091
-        source "$VENV_PATH/bin/activate"
     fi
-    echo "==> Using Python virtualenv: $(which python)"
+
+    # shellcheck disable=SC1091
+    source "$VENV_PATH/bin/activate"
+
+    # A venv directory existing is not the same as a working venv - an
+    # interrupted first run (Ctrl+C mid `pip install`, disk full, etc.)
+    # leaves the directory in place with an incomplete/broken interpreter,
+    # and every future run silently "succeeds" at activation while nothing
+    # actually works. Fail loudly here instead of surfacing as a random
+    # ModuleNotFoundError three steps later.
+    if ! command -v python >/dev/null 2>&1; then
+        echo "ERROR: $VENV_PATH exists but has no working 'python' executable - it's likely"
+        echo "       left over from an interrupted setup. Fix with:"
+        echo "         rm -rf $VENV_PATH && ./start_kenjin.sh"
+        exit 1
+    fi
+
+    # THE ACTUAL FIX for 'ModuleNotFoundError: No module named asyncpg' and
+    # its siblings: previously, requirements.txt was only ever installed at
+    # the moment the venv was FIRST created - reusing an existing venv on
+    # every later run skipped `pip install` entirely, so any dependency
+    # added after that venv existed (asyncpg, for instance) was never
+    # actually installed into it. Now: hash-gate a real install/sync on
+    # every run, so it's both correct (drift is caught, not just at
+    # creation time) and fast (skips the pip resolve entirely when nothing
+    # changed, instead of paying that cost on every single launch).
+    REQ_FILE="orchestrator/requirements.txt"
+    REQ_HASH_FILE="$VENV_PATH/.requirements.sha256"
+    NEW_REQ_HASH="$(sha256sum "$REQ_FILE" 2>/dev/null | awk '{print $1}')"
+    OLD_REQ_HASH="$(cat "$REQ_HASH_FILE" 2>/dev/null || echo "")"
+    if [ "$NEW_REQ_HASH" != "$OLD_REQ_HASH" ] || ! python -c "import asyncpg" >/dev/null 2>&1; then
+        echo "==> Installing/syncing Python dependencies from $REQ_FILE..."
+        pip install --upgrade pip --quiet
+        if [ -f "$REQ_FILE" ]; then
+            pip install -r "$REQ_FILE"
+        fi
+        echo "$NEW_REQ_HASH" > "$REQ_HASH_FILE"
+    else
+        echo "==> Python dependencies already up to date."
+    fi
+    echo "==> Using Python virtualenv: $(command -v python)"
 fi
 
 # -----------------------------------------------------------------------------
@@ -178,8 +237,17 @@ HOST="$KENJIN_HOST"
 PORT="$KENJIN_PORT"
 
 echo "==> Starting Kenjin Orchestrator API (http://${HOST}:${PORT})..."
+# v11.07 FIX: previously this redirected uvicorn's entire stdout/stderr
+# straight to $LOG_DIR/orchestrator.log with nothing shown in the terminal -
+# the backend engine's logs (job cycles, request errors, model retrain
+# messages, everything) were only ever visible by separately tailing the
+# log file, which is easy to not realize you need to do. `> >(tee file)` is
+# process substitution, not a real pipe, so `$!` still captures uvicorn's
+# own PID (not tee's) - the cleanup() trap below still kills the right
+# process. Output now appears live in this terminal AND is still persisted
+# to the log file for after-the-fact debugging.
 uvicorn orchestrator.main:app --host "$HOST" --port "$PORT" --env-file .env \
-    >"$LOG_DIR/orchestrator.log" 2>&1 &
+    > >(tee "$LOG_DIR/orchestrator.log") 2>&1 &
 UVICORN_PID=$!
 
 ELECTRON_PID=""
