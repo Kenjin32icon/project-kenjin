@@ -14,3 +14,5 @@ docker-compose.yml
 Docs/PROJECT_KENJIN_REFACTOR_PLAN.md.pdf
 .migration_tmp/kenjin_supabase.dump
 scripts/migrate_supabase_to_local.sh
+logs/orchestrator.log
+logs/mt5_wine.log
