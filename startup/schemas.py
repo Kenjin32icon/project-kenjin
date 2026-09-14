@@ -56,21 +56,21 @@ class StrategyParamsOut(BaseModel):
     forecast_id: Optional[int] = None
     bullish_prob: Optional[float] = None
     bearish_prob: Optional[float] = None
-    tier2_action: str = "HOLD"  # BUY, SELL, or HOLD
+    tier2_action: str = "HOLD"
     tier2_confidence: float = Field(0.0, ge=0.0, le=1.0)
     recommended_lot_multiplier: float = 1.0
     
-    # v11.3: short-horizon (~1-2min) statistical trend, independent of tier2_action
     micro_trend: str = Field("NEUTRAL", description="Short-horizon 1-2 min direction: BULLISH, BEARISH, NEUTRAL")
     micro_trend_strength: float = Field(0.0, ge=0.0, le=1.0, description="Normalized velocity strength (0.0 to 1.0)")
     
-    # v11: predictive session scheduling, populated by hour_scheduler.py
     scheduled_start_hour: Optional[int] = Field(None, ge=0, le=23, description="UTC start hour for allowed executions")
     scheduled_end_hour: Optional[int] = Field(None, ge=0, le=23, description="UTC end hour for allowed executions")
     
-    # Calibration metrics for risk adjustments
     calibration_score: Optional[float] = Field(None, description="Brier calibration score over rolling 30 days")
     calibration_n: Optional[int] = None
+
+    # NEW v11.08: normalized-bps rolling stdev regime read
+    volatility_regime: float = 0.0
 
 
 class HealthOut(BaseModel):
