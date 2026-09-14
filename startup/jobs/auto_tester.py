@@ -14,10 +14,29 @@ from startup.db import get_pool
 
 log = logging.getLogger("auto_tester")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
-MT5_TERMINAL_PATH = os.environ.get(
-    "MT5_PATH", 
-    'env WINEPREFIX="/home/infoscience/.wine" wine-stable "C:\\users\\Public\\Desktop\\FBS MetaTrader 5.lnk"'
-)
+
+
+def _build_mt5_terminal_path() -> str:
+    explicit = os.environ.get("MT5_PATH", "").strip()
+    if explicit:
+        return explicit
+
+    # Portable fallbacks: derive the Wine-side username from the actual
+    # logged-in Linux user (Wine mirrors it into drive_c/users/<name> by
+    # default), default WINE_BIN to the binary the standard `apt install
+    # wine` package actually provides, and default WINEPREFIX under the
+    # current user's $HOME rather than a hardcoded stranger's home dir.
+    linux_user = os.environ.get("USER") or os.environ.get("LOGNAME") or "Public"
+    wineprefix = os.environ.get("WINEPREFIX_DEMO", os.path.expanduser("~/.wine-kenjin-demo"))
+    wine_bin = os.environ.get("WINE_BIN", "wine")
+    shortcut = os.environ.get(
+        "MT5_SHORTCUT_PATH_DEMO",
+        rf"C:\users\{linux_user}\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\FBS MetaTrader 5\FBS MT5.lnk",
+    )
+    return f'env WINEPREFIX="{wineprefix}" {wine_bin} "{shortcut}"'
+
+
+MT5_TERMINAL_PATH = _build_mt5_terminal_path()
 
 
 def archive_and_parse_report(wine_report_path: str, asset: str, local_reports_dir: str = "./reports") -> dict:
@@ -116,9 +135,12 @@ ShutdownTerminal=1
     )
     await proc.communicate()
     
-    report_path = f"/home/infoscience/.wine/drive_c/Program Files/MetaTrader 5/Tester/{asset}_report.xml"
+    # Check temporary path first, then Wine prefix path
+    report_path = f"/tmp/{asset}_report.xml"
     if not os.path.exists(report_path):
-        report_path = f"/tmp/{asset}_report.xml"
+        linux_user = os.environ.get("USER") or os.environ.get("LOGNAME") or "Public"
+        wineprefix = os.environ.get("WINEPREFIX_DEMO", os.path.expanduser("~/.wine-kenjin-demo"))
+        report_path = os.path.join(wineprefix, f"drive_c/Program Files/MetaTrader 5/Tester/{asset}_report.xml")
     return report_path
 
 
@@ -190,10 +212,11 @@ async def continuous_tester_cycle() -> None:
                 log.error(f"Report not found for {asset} at {report_path}")
                 continue
 
+            local_reports_dir = os.path.expanduser("~/project-kenjin/reports")
             real_parsed_data = archive_and_parse_report(
                 wine_report_path=report_path,
                 asset=asset,
-                local_reports_dir="/home/infoscience/project-kenjin/reports"
+                local_reports_dir=local_reports_dir
             )
 
             if real_parsed_data and real_parsed_data.get("total_trades", 0) > 0:
