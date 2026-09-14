@@ -39,8 +39,14 @@ from startup.schemas import (
     AccountSnapshotIn, RiskIncidentIn,
 )
 from startup.jobs.feature_pull import pull_feature_window as pg_pull_feature_window
-from startup.jobs.ml_tier2 import evaluate_tier2_signal, train_neural_maps, compute_micro_trend, clear_model_cache
-from startup.jobs.ml_tier2 import pull_feature_window as redis_pull_feature_window
+
+# --- UPDATE A: Loaded Online Learner dependencies ---
+from startup.jobs.ml_tier2 import (
+    evaluate_tier2_signal, train_neural_maps, compute_micro_trend, clear_model_cache,
+    pull_feature_window as redis_pull_feature_window,
+    OnlineTierUpdater, set_online_updater, record_closed_trade_for_online_learning # <-- NEW v11.08
+)
+
 from startup.jobs.auto_tester import continuous_tester_cycle
 from startup.jobs import lifeline_engine
 from startup.auth import verify_api_key
@@ -190,6 +196,15 @@ async def get_hot_feature_window(asset: str, minutes: int = 30) -> pd.DataFrame:
 async def lifespan(app: FastAPI):
     validate_groq_model()
     await init_db_pool()
+
+    # --- UPDATE A: Load Online Learner at Startup ---
+    try:
+        online_updater = await OnlineTierUpdater.load()
+        set_online_updater(online_updater)
+        logger.info("v11.08: online tier-2 EV adjustment model loaded from Redis (or initialized fresh).")
+    except Exception as e:
+        logger.warning(f"Failed to load OnlineTierUpdater: {e}")
+    # ------------------------------------------------
 
     try:
         from startup.jobs.groq_forecast import run_forecast_cycle
@@ -403,6 +418,7 @@ async def get_strategy_params(asset: str):
         tier2 = {"action": "HOLD", "confidence": 0.0, "lot_multiplier": 1.0}
         micro = {"micro_trend": "NEUTRAL", "micro_trend_strength": 0.0}
 
+    # --- UPDATE B: Passed Volatility Field ---
     return StrategyParamsOut(
         asset=row["asset"],
         opt_threshold=opt_threshold,
@@ -421,6 +437,7 @@ async def get_strategy_params(asset: str):
         scheduled_end_hour=row["scheduled_end_hour"],
         micro_trend=micro.get("micro_trend", "NEUTRAL"),
         micro_trend_strength=micro.get("micro_trend_strength", 0.0),
+        volatility_regime=tier2.get("volatility_regime", 0.0),   # NEW v11.08
     )
 
 
@@ -453,6 +470,58 @@ async def post_ticks(payload: TickIn, background_tasks: BackgroundTasks):
     return {"status": "accepted", "asset": payload.asset}
 
 
+# --- UPDATE C: Online Learning Background Task ---
+async def trigger_online_learning_update(asset: str, closed_profit: float, entry_score: float):
+    """Background task to fetch entry snapshot and trigger online learning."""
+    try:
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            # Reconstruct feature snapshot from the most recent tick prior to the trade OPEN
+            open_row = await conn.fetchrow(
+                "SELECT created_at FROM trade_telemetry WHERE asset = $1 AND type LIKE '%OPEN%' ORDER BY created_at DESC LIMIT 1",
+                asset
+            )
+            if not open_row: return
+
+            rows = await conn.fetch(
+                """
+                SELECT rsi, bid, ma10, ma50, tick_volume 
+                FROM tick_telemetry WHERE asset = $1 AND ts <= $2 
+                ORDER BY ts DESC LIMIT 30
+                """,
+                asset, open_row["created_at"]
+            )
+        
+        if not rows: return
+
+        # Re-engineer the snapshot vectors exactly like fetch_recent_telemetry()
+        df = pd.DataFrame([dict(r) for r in rows]).iloc[::-1].reset_index(drop=True)
+        for col in ['rsi', 'bid', 'ma10', 'ma50', 'tick_volume']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+
+        df['ma_spread'] = df['ma10'] - df['ma50']
+        df['ma_spread_delta'] = df['ma_spread'] - df['ma_spread'].shift(1).fillna(0.0)
+        df['price_velocity_1m'] = df['bid'].diff(1).fillna(0.0)
+
+        mean_vol = df['tick_volume'].rolling(window=30, min_periods=1).mean()
+        df['rvol'] = np.where(mean_vol > 0, df['tick_volume'] / mean_vol, 1.0)
+
+        latest = df.iloc[-1]
+        
+        await record_closed_trade_for_online_learning(
+            features={
+                "ma_spread_delta": float(latest["ma_spread_delta"]),
+                "price_velocity_1m": float(latest["price_velocity_1m"]),
+                "rsi": float(latest["rsi"]),
+                "rvol": float(latest["rvol"]),
+            },
+            batch_e_utility=float(entry_score) if entry_score else 0.0,
+            actual_profit=closed_profit,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to record online learning telemetry for {asset}: {e}")
+
 @app.post(
     "/telemetry",
     status_code=status.HTTP_201_CREATED,
@@ -479,8 +548,11 @@ async def post_telemetry(payload: TelemetryIn, background_tasks: BackgroundTasks
         logger.exception("Failed to insert trade_telemetry row for %s", payload.asset)
         raise HTTPException(status_code=500, detail="Failed to store telemetry.")
     
+    # --- UPDATE C: Hooked into post_telemetry() ---
     if payload.account_type == "live" and "CLOSE" in (payload.type or ""):
         background_tasks.add_task(lifeline_engine.record_trade_outcome, payload.asset, payload.profit)
+        # NEW v11.08: Push entry features and exit profit into the online learner
+        background_tasks.add_task(trigger_online_learning_update, payload.asset, payload.profit, payload.entry_score)
         
     return {"status": "logged", "asset": payload.asset}
 
