@@ -76,6 +76,10 @@ class StrategyParamsOut(BaseModel):
 class HealthOut(BaseModel):
     status: str
     db: str
+    redis: str = "unknown"
+    groq: str = "unknown"
+    mt5_last_seen_seconds: Optional[float] = None
+
 
 class AccountSnapshotIn(BaseModel):
     account_type: str                                  # 'demo' or 'live'
