@@ -39,12 +39,12 @@ from startup.schemas import (
     AccountSnapshotIn, RiskIncidentIn,
 )
 from startup.jobs.feature_pull import pull_feature_window as pg_pull_feature_window
-from startup.jobs.ml_tier2 import evaluate_tier2_signal, train_neural_maps, compute_micro_trend
+from startup.jobs.ml_tier2 import evaluate_tier2_signal, train_neural_maps, compute_micro_trend, clear_model_cache
 from startup.jobs.ml_tier2 import pull_feature_window as redis_pull_feature_window
 from startup.jobs.auto_tester import continuous_tester_cycle
-from startup.jobs import lifeline_engine          # <-- NEW
+from startup.jobs import lifeline_engine
 from startup.auth import verify_api_key
-from startup.ws_manager import manager  # [NEW IMPORT]
+from startup.ws_manager import manager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("orchestrator")
@@ -148,7 +148,7 @@ async def fetch_recent_telemetry() -> pd.DataFrame:
                 ORDER BY ts DESC LIMIT 1
             ) te ON true
             WHERE tt.created_at >= $1
-              AND tt.account_type = 'live'  -- FIX: Prevent demo leak into Neural Map
+              AND tt.account_type = 'live'  -- Prevent demo leak into Neural Map
         """, since)
         
     if not rows:
@@ -156,12 +156,10 @@ async def fetch_recent_telemetry() -> pd.DataFrame:
 
     df = pd.DataFrame([dict(r) for r in rows])
 
-    # Convert numeric fields to float
     for col in ['profit', 'rsi', 'bid', 'ask', 'ma10', 'ma50', 'tick_volume']:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
 
-    # Compute engineered features required by train_neural_maps()
     df['ma_spread'] = df['ma10'] - df['ma50']
     df['ma_spread_delta'] = df['ma_spread'] - df['ma_spread'].shift(1).fillna(0.0)
     df['price_velocity_1m'] = df['bid'].diff(1).fillna(0.0)
@@ -179,12 +177,11 @@ async def get_hot_feature_window(asset: str, minutes: int = 30) -> pd.DataFrame:
             if len(df) >= MIN_REDIS_ROWS_FOR_HOT_PATH:
                 return df
             return df
-            return await pg_pull_feature_window(asset, minutes=minutes)
         except Exception as e:
             if attempt == 2:
                 logger.exception("Redis/PG feature window failed entirely for %s.", asset)
             else:
-                await asyncio.sleep(0.5 + random.uniform(0, 0.5))  # Jittered backoff
+                await asyncio.sleep(0.5 + random.uniform(0, 0.5))
 
     return pd.DataFrame()
 
@@ -192,7 +189,6 @@ async def get_hot_feature_window(asset: str, minutes: int = 30) -> pd.DataFrame:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate_groq_model()
-
     await init_db_pool()
 
     try:
@@ -205,13 +201,28 @@ async def lifespan(app: FastAPI):
         async def run_retrain_cycle():
             df = await fetch_recent_telemetry()
             if len(df) >= 50:
-                await asyncio.to_thread(train_neural_maps, df)
-                logger.info(f"Retrained Triple Neural Map on {len(df)} recent trades.")
+                trained = await asyncio.to_thread(train_neural_maps, df)
+                if trained:
+                    logger.info(f"Retrained Triple Neural Map on {len(df)} recent trades.")
+                    try:
+                        await manager.broadcast({
+                            "type": "MODEL_UPDATED",
+                            "message": "Models retrained",
+                            "records": len(df),
+                            "timestamp": time.time()
+                        })
+                    except Exception as e:
+                        logger.warning(f"Model update broadcast failed: {e}")
+                else:
+                    logger.info("Retrain returned False (no training performed).")
             else:
                 logger.info(f"[Retrain] Insufficient telemetry sample size ({len(df)}/50). Skipping cycle.")
 
-        scheduler.add_job(run_forecast_cycle, "interval", minutes=15, id="run_forecast_cycle")
-        scheduler.add_job(run_gatekeeper_cycle, "interval", hours=1, id="run_gatekeeper_cycle")
+        FORECAST_INTERVAL_MIN = int(os.environ.get("FORECAST_INTERVAL_MIN", "15"))
+        GATEKEEPER_INTERVAL_HOURS = int(os.environ.get("GATEKEEPER_INTERVAL_HOURS", "1"))
+
+        scheduler.add_job(run_forecast_cycle, "interval", minutes=FORECAST_INTERVAL_MIN, id="run_forecast_cycle")
+        scheduler.add_job(run_gatekeeper_cycle, "interval", hours=GATEKEEPER_INTERVAL_HOURS, id="run_gatekeeper_cycle")
         scheduler.add_job(run_retrain_cycle, "interval", hours=6, id="run_retrain_cycle")
         scheduler.add_job(run_hour_scheduler_cycle, "interval", hours=12, id="run_hour_scheduler_cycle")
         scheduler.add_job(run_calibration_cycle, "interval", hours=24, id="run_calibration_cycle")
@@ -220,7 +231,7 @@ async def lifespan(app: FastAPI):
 
         scheduler.start()
         logger.info(
-            "APScheduler initialized: Forecast (15m), Gatekeeper (1h), ML Retrain (6h), "
+            "APScheduler initialized: Forecast (Env), Gatekeeper (Env), ML Retrain (6h), "
             "Hour Scheduler (12h), Confidence Calibration (24h), AutoTester (4h), DB Pruner (24h)."
         )
     except Exception as e:
@@ -239,7 +250,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# 1. Enable CORS for Electron desktop app and web preflight (OPTIONS /kpis)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -248,7 +258,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Absolute Path for Static Directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
@@ -258,15 +267,20 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR, check_dir=False), name="s
 
 # --- ROUTES ---
 
-# ==========================================
-# [NEW] WEBSOCKET ROUTE FOR ELECTRON DASHBOARD
-# ==========================================
 @app.websocket("/ws/dashboard")
 async def websocket_dashboard_endpoint(websocket: WebSocket):
+    api_key = websocket.query_params.get("api_key") or websocket.headers.get("x-api-key") or ""
+    expected = os.environ.get("ORCH_API_KEY", "")
+    if not expected:
+        await websocket.close(code=1008)
+        return
+    if api_key != expected:
+        await websocket.close(code=1008)
+        return
+
     await manager.connect(websocket)
     try:
         while True:
-            # Keep connection alive and listen for manual dashboard overrides
             data = await websocket.receive_text()
             if data == "PING":
                 await websocket.send_text("PONG")
@@ -276,14 +290,43 @@ async def websocket_dashboard_endpoint(websocket: WebSocket):
 
 @app.get("/health", response_model=HealthOut, tags=["System Health"], summary="Service and Database Health Check")
 async def health():
+    db_status = "down"
     try:
         pool = get_pool()
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1;")
-        return HealthOut(status="ok", db="ok")
+        db_status = "ok"
     except Exception as exc:
         logger.error(f"Healthcheck DB failure: {exc}")
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Database unreachable: {exc}")
+
+    redis_status = "down"
+    try:
+        await redis_client.ping()
+        redis_status = "ok"
+    except Exception as exc:
+        logger.warning(f"Healthcheck Redis failure: {exc}")
+        redis_status = "down"
+
+    groq_status = "configured" if os.environ.get("GROQ_API_KEY", "").strip() else "not_configured"
+
+    mt5_last_seen_seconds = None
+    try:
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT MAX(ts) AS last_ts FROM account_snapshots")
+        if row and row["last_ts"]:
+            mt5_last_seen_seconds = (datetime.now(timezone.utc) - row["last_ts"]).total_seconds()
+    except Exception as exc:
+        logger.warning(f"Healthcheck MT5-last-seen lookup failed: {exc}")
+
+    return HealthOut(
+        status="ok",
+        db=db_status,
+        redis=redis_status,
+        groq=groq_status,
+        mt5_last_seen_seconds=mt5_last_seen_seconds,
+    )
 
 
 @app.get(
@@ -294,10 +337,6 @@ async def health():
     summary="Fetch Optimized Parameters & Tier-2 Signals",
 )
 async def get_strategy_params(asset: str):
-    """
-    Fetches strategy configuration, evaluates real-time Redis feature windows,
-    computes micro-trends, and returns parameters to MQL5.
-    """
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -311,7 +350,6 @@ async def get_strategy_params(asset: str):
             asset,
         )
         if not row:
-            logger.warning("strategy_db had no row for '%s' - auto-bootstrapping defaults.", asset)
             row = await conn.fetchrow(
                 """
                 INSERT INTO strategy_db (asset, opt_threshold, opt_sl_mult, opt_tp_mult, rsi_buy_max, rsi_sell_min, live_approved, updated_at)
@@ -343,8 +381,15 @@ async def get_strategy_params(asset: str):
     else:
         calibration_multiplier = 1.0
 
-    # [NEW] Strategic Profit Lifeline gate
-    lifeline_multiplier, lifeline_terminated = await lifeline_engine.get_lifeline_multiplier(asset)
+    # Guarded Strategic Profit Lifeline gate call
+    try:
+        lifeline_multiplier, lifeline_terminated = await lifeline_engine.get_lifeline_multiplier(asset)
+    except Exception:
+        logger.exception(
+            "Lifeline lookup failed for %s - has sql/migrations/002_strategic_profit_lifeline.sql "
+            "been applied to this database? Degrading to multiplier=1.0/terminated=False.", asset,
+        )
+        lifeline_multiplier, lifeline_terminated = 1.0, False
 
     try:
         df = await get_hot_feature_window(asset, minutes=30)
@@ -365,7 +410,7 @@ async def get_strategy_params(asset: str):
         opt_tp_mult=float(row["opt_tp_mult"]) if row["opt_tp_mult"] is not None else 3.0,
         rsi_buy_max=float(row["rsi_buy_max"]) if row["rsi_buy_max"] is not None else 70.0,
         rsi_sell_min=float(row["rsi_sell_min"]) if row["rsi_sell_min"] is not None else 30.0,
-        live_approved=bool(row["live_approved"]) and not lifeline_terminated,  # [CHANGED] defense in depth
+        live_approved=bool(row["live_approved"]) and not lifeline_terminated,
         forecast_id=forecast["id"] if forecast else None,
         bullish_prob=bullish_prob,
         bearish_prob=bearish_prob,
@@ -390,7 +435,6 @@ async def post_ticks(payload: TickIn, background_tasks: BackgroundTasks):
     background_tasks.add_task(insert_tick_row, payload)
     background_tasks.add_task(cache_tick_to_redis, payload.asset, payload.model_dump())
     
-    # [NEW] Broadcast real-time micro-trend and price data to dashboard
     tick_data = payload.model_dump()
     await manager.broadcast({
         "type": "TICK_UPDATE",
@@ -400,14 +444,11 @@ async def post_ticks(payload: TickIn, background_tasks: BackgroundTasks):
         "expected_value": tick_data.get("expected_value", 0.0)
     })
 
-    # [NEW] Hook for Future Online Learning:
-    # If this tick represents a closed trade, broadcast a trigger
     if tick_data.get("is_trade_close"):
         await manager.broadcast({
             "type": "TRADE_CLOSED",
             "profit": tick_data.get("profit")
         })
-        # Future function call: await trigger_incremental_learning(tick_data)
 
     return {"status": "accepted", "asset": payload.asset}
 
@@ -438,12 +479,11 @@ async def post_telemetry(payload: TelemetryIn, background_tasks: BackgroundTasks
         logger.exception("Failed to insert trade_telemetry row for %s", payload.asset)
         raise HTTPException(status_code=500, detail="Failed to store telemetry.")
     
-    # [NEW] Strategic Profit Lifeline: only closed trades carry a settled
-    # profit/loss, so only CLOSE events feed the survival economy.
     if payload.account_type == "live" and "CLOSE" in (payload.type or ""):
         background_tasks.add_task(lifeline_engine.record_trade_outcome, payload.asset, payload.profit)
         
     return {"status": "logged", "asset": payload.asset}
+
 
 @app.post(
     "/account_snapshot",
@@ -496,7 +536,6 @@ async def post_risk_incident(payload: RiskIncidentIn):
     logger.warning("RISK INCIDENT: %s | %s | %s | %s",
                     payload.account_type, payload.asset, payload.reason, payload.details)
     
-    # [NEW] Push high-priority alerts immediately to the UI
     risk_data = payload.model_dump()
     await manager.broadcast({
         "type": "RISK_ALERT",
@@ -505,6 +544,30 @@ async def post_risk_incident(payload: RiskIncidentIn):
     })
 
     return {"status": "logged", "reason": payload.reason}
+
+
+@app.post(
+    "/models/reload",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Control"],
+    summary="Force Clear Model Cache",
+)
+async def models_reload():
+    """
+    Force the in-memory model cache to clear so subsequent Tier-2 evaluation
+    will reload models from disk. Useful after manual model swaps/deploys.
+    """
+    try:
+        clear_model_cache()
+        await manager.broadcast({
+            "type": "MODEL_UPDATED",
+            "message": "Admin requested model reload",
+            "timestamp": time.time()
+        })
+    except Exception as e:
+        logger.exception("Failed to clear model cache")
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "ok", "message": "Model cache cleared; models will be reloaded on next evaluation."}
 
 
 @app.post(
@@ -544,14 +607,9 @@ async def trigger_hour_scheduler(background_tasks: BackgroundTasks):
     summary="Aggregated KPIs for the Dashboard",
 )
 async def get_kpis():
-    """
-    v11.4: single endpoint powering static/dashboard.html with CORS support and absolute static pathing.
-    Includes in-memory TTL caching with graceful degradation.
-    """
     global _KPI_CACHE
     current_time = time.time()
 
-    # Return cached data if valid
     if _KPI_CACHE["data"] and (current_time - _KPI_CACHE["timestamp"]) < KPI_CACHE_TTL:
         return _KPI_CACHE["data"]
 
@@ -732,6 +790,7 @@ async def get_kpis():
             return _KPI_CACHE["data"]
         raise HTTPException(status_code=500, detail="Database timeout and no cached data available.")
 
+
 # -----------------------------------------------------------------------------
 # Control & Job Endpoints
 # -----------------------------------------------------------------------------
@@ -742,15 +801,11 @@ class LifelineResetRequest(BaseModel):
 
 @app.post("/control/lifeline_reset", dependencies=[Depends(verify_api_key)], tags=["Control"])
 async def lifeline_reset(payload: LifelineResetRequest):
-    """Re-arms an asset the Strategic Profit Lifeline engine hard-terminated."""
     await lifeline_engine.manual_reset(payload.asset, payload.reason)
     return {"status": "success", "asset": payload.asset, "message": "Lifeline reset to baseline."}
 
 @app.post("/control/kill_switch", dependencies=[Depends(verify_api_key)], tags=["Control"])
 async def emergency_kill_switch(payload: KillSwitchRequest):
-    """
-    Emergency Halt: Deactivates live approval across all symbol strategies in Redis & Postgres.
-    """
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute("UPDATE strategy_db SET live_approved = FALSE")
@@ -762,9 +817,6 @@ async def emergency_kill_switch(payload: KillSwitchRequest):
 
 @app.post("/jobs/retrain", dependencies=[Depends(verify_api_key)], tags=["Control"])
 async def trigger_model_retrain(background_tasks: BackgroundTasks):
-    """
-    Triggers LightGBM background retraining.
-    """
     telemetry_df = await fetch_recent_telemetry()
 
     if telemetry_df.empty or len(telemetry_df) < 50:
@@ -779,9 +831,6 @@ async def trigger_model_retrain(background_tasks: BackgroundTasks):
 
 @app.post("/jobs/calibrate", dependencies=[Depends(verify_api_key)], tags=["Control"])
 async def trigger_confidence_calibration(background_tasks: BackgroundTasks):
-    """
-    Calculates Brier calibration scores over 30-day telemetry.
-    """
     from startup.jobs.confidence_calibration import run_calibration_cycle
     background_tasks.add_task(run_calibration_cycle)
     
@@ -792,9 +841,6 @@ async def trigger_confidence_calibration(background_tasks: BackgroundTasks):
 
 @app.patch("/strategy_params", dependencies=[Depends(verify_api_key)], tags=["Control"])
 async def patch_strategy_params(payload: StrategyPatchRequest):
-    """
-    Updates live_approved flag for an individual trading pair.
-    """
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
