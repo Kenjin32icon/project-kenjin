@@ -36,7 +36,7 @@ from db.redis_client import redis_client
 from startup.db import close_db_pool, get_pool, init_db_pool
 from startup.schemas import (
     HealthOut, StrategyParamsOut, TelemetryIn, TickIn,
-    AccountSnapshotIn, RiskIncidentIn,
+    AccountSnapshotIn, RiskIncidentIn, MissedTradeIn,
 )
 from startup.jobs.feature_pull import pull_feature_window as pg_pull_feature_window
 
@@ -44,11 +44,15 @@ from startup.jobs.feature_pull import pull_feature_window as pg_pull_feature_win
 from startup.jobs.ml_tier2 import (
     evaluate_tier2_signal, train_neural_maps, compute_micro_trend, clear_model_cache,
     pull_feature_window as redis_pull_feature_window,
-    OnlineTierUpdater, set_online_updater, record_closed_trade_for_online_learning # <-- NEW v11.08
+    OnlineTierUpdater, set_online_updater, record_closed_trade_for_online_learning
 )
 
 from startup.jobs.auto_tester import continuous_tester_cycle
 from startup.jobs import lifeline_engine
+from startup.jobs.missed_trade_evaluator import (
+    run_missed_trade_evaluation_cycle,
+    get_missed_trade_summary,
+)
 from startup.auth import verify_api_key
 from startup.ws_manager import manager
 
@@ -179,7 +183,7 @@ async def fetch_recent_telemetry() -> pd.DataFrame:
 async def get_hot_feature_window(asset: str, minutes: int = 30) -> pd.DataFrame:
     for attempt in range(3):
         try:
-            df = await redis_pull_feature_window(asset, window_minutes=minutes)
+            df = await redis_pull_feature_window(asset, minutes)
             if len(df) >= MIN_REDIS_ROWS_FOR_HOT_PATH:
                 return df
             return df
@@ -197,14 +201,12 @@ async def lifespan(app: FastAPI):
     validate_groq_model()
     await init_db_pool()
 
-    # --- UPDATE A: Load Online Learner at Startup ---
     try:
         online_updater = await OnlineTierUpdater.load()
         set_online_updater(online_updater)
-        logger.info("v11.08: online tier-2 EV adjustment model loaded from Redis (or initialized fresh).")
+        logger.info("v11.09: online tier-2 EV adjustment model loaded from Redis (or initialized fresh).")
     except Exception as e:
         logger.warning(f"Failed to load OnlineTierUpdater: {e}")
-    # ------------------------------------------------
 
     try:
         from startup.jobs.groq_forecast import run_forecast_cycle
@@ -244,10 +246,17 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(continuous_tester_cycle, "interval", hours=4, id="continuous_tester_cycle")
         scheduler.add_job(run_snapshot_pruning_cycle, "interval", hours=24, id="run_snapshot_pruning_cycle")
 
+        MISSED_TRADE_EVAL_INTERVAL_MIN = int(os.environ.get("MISSED_TRADE_EVAL_INTERVAL_MIN", "15"))
+        scheduler.add_job(
+            run_missed_trade_evaluation_cycle, "interval",
+            minutes=MISSED_TRADE_EVAL_INTERVAL_MIN, id="run_missed_trade_evaluation_cycle",
+        )
+
         scheduler.start()
         logger.info(
             "APScheduler initialized: Forecast (Env), Gatekeeper (Env), ML Retrain (6h), "
-            "Hour Scheduler (12h), Confidence Calibration (24h), AutoTester (4h), DB Pruner (24h)."
+            "Hour Scheduler (12h), Confidence Calibration (24h), AutoTester (4h), DB Pruner (24h), "
+            "Missed-Trade Evaluator (%sm).", MISSED_TRADE_EVAL_INTERVAL_MIN
         )
     except Exception as e:
         logger.warning(f"Failed scheduling background jobs: {e}")
@@ -356,24 +365,36 @@ async def get_strategy_params(asset: str):
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT asset, opt_threshold, opt_sl_mult, opt_tp_mult,
-                   rsi_buy_max, rsi_sell_min, live_approved,
-                   scheduled_start_hour, scheduled_end_hour,
-                   calibration_score, calibration_n
-            FROM strategy_db WHERE asset = $1
+            SELECT s.asset, s.opt_threshold, s.opt_sl_mult, s.opt_tp_mult,
+                   s.rsi_buy_max, s.rsi_sell_min, s.live_approved,
+                   s.scheduled_start_hour, s.scheduled_end_hour,
+                   s.calibration_score, s.calibration_n,
+                   sl.lifeline_score, sl.terminated AS lifeline_terminated
+            FROM strategy_db s
+            LEFT JOIN strategy_lifeline sl ON s.asset = sl.asset
+            WHERE s.asset = $1
             """,
             asset,
         )
         if not row:
             row = await conn.fetchrow(
                 """
-                INSERT INTO strategy_db (asset, opt_threshold, opt_sl_mult, opt_tp_mult, rsi_buy_max, rsi_sell_min, live_approved, updated_at)
-                VALUES ($1, 0.60, 1.5, 3.0, 70.0, 30.0, false, NOW())
-                ON CONFLICT (asset) DO UPDATE SET asset = EXCLUDED.asset
-                RETURNING asset, opt_threshold, opt_sl_mult, opt_tp_mult,
-                          rsi_buy_max, rsi_sell_min, live_approved,
-                          scheduled_start_hour, scheduled_end_hour,
-                          calibration_score, calibration_n
+                WITH inserted AS (
+                    INSERT INTO strategy_db (asset, opt_threshold, opt_sl_mult, opt_tp_mult, rsi_buy_max, rsi_sell_min, live_approved, updated_at)
+                    VALUES ($1, 0.60, 1.5, 3.0, 70.0, 30.0, false, NOW())
+                    ON CONFLICT (asset) DO UPDATE SET asset = EXCLUDED.asset
+                    RETURNING asset, opt_threshold, opt_sl_mult, opt_tp_mult,
+                              rsi_buy_max, rsi_sell_min, live_approved,
+                              scheduled_start_hour, scheduled_end_hour,
+                              calibration_score, calibration_n
+                )
+                SELECT s.asset, s.opt_threshold, s.opt_sl_mult, s.opt_tp_mult,
+                       s.rsi_buy_max, s.rsi_sell_min, s.live_approved,
+                       s.scheduled_start_hour, s.scheduled_end_hour,
+                       s.calibration_score, s.calibration_n,
+                       sl.lifeline_score, sl.terminated AS lifeline_terminated
+                FROM inserted s
+                LEFT JOIN strategy_lifeline sl ON s.asset = sl.asset
                 """,
                 asset,
             )
@@ -418,7 +439,6 @@ async def get_strategy_params(asset: str):
         tier2 = {"action": "HOLD", "confidence": 0.0, "lot_multiplier": 1.0}
         micro = {"micro_trend": "NEUTRAL", "micro_trend_strength": 0.0}
 
-    # --- UPDATE B: Passed Volatility Field ---
     return StrategyParamsOut(
         asset=row["asset"],
         opt_threshold=opt_threshold,
@@ -437,7 +457,7 @@ async def get_strategy_params(asset: str):
         scheduled_end_hour=row["scheduled_end_hour"],
         micro_trend=micro.get("micro_trend", "NEUTRAL"),
         micro_trend_strength=micro.get("micro_trend_strength", 0.0),
-        volatility_regime=tier2.get("volatility_regime", 0.0),   # NEW v11.08
+        volatility_regime=tier2.get("volatility_regime", 0.0),
     )
 
 
@@ -470,13 +490,11 @@ async def post_ticks(payload: TickIn, background_tasks: BackgroundTasks):
     return {"status": "accepted", "asset": payload.asset}
 
 
-# --- UPDATE C: Online Learning Background Task ---
 async def trigger_online_learning_update(asset: str, closed_profit: float, entry_score: float):
     """Background task to fetch entry snapshot and trigger online learning."""
     try:
         pool = get_pool()
         async with pool.acquire() as conn:
-            # Reconstruct feature snapshot from the most recent tick prior to the trade OPEN
             open_row = await conn.fetchrow(
                 "SELECT created_at FROM trade_telemetry WHERE asset = $1 AND type LIKE '%OPEN%' ORDER BY created_at DESC LIMIT 1",
                 asset
@@ -494,7 +512,6 @@ async def trigger_online_learning_update(asset: str, closed_profit: float, entry
         
         if not rows: return
 
-        # Re-engineer the snapshot vectors exactly like fetch_recent_telemetry()
         df = pd.DataFrame([dict(r) for r in rows]).iloc[::-1].reset_index(drop=True)
         for col in ['rsi', 'bid', 'ma10', 'ma50', 'tick_volume']:
             if col in df.columns:
@@ -548,10 +565,8 @@ async def post_telemetry(payload: TelemetryIn, background_tasks: BackgroundTasks
         logger.exception("Failed to insert trade_telemetry row for %s", payload.asset)
         raise HTTPException(status_code=500, detail="Failed to store telemetry.")
     
-    # --- UPDATE C: Hooked into post_telemetry() ---
     if payload.account_type == "live" and "CLOSE" in (payload.type or ""):
         background_tasks.add_task(lifeline_engine.record_trade_outcome, payload.asset, payload.profit)
-        # NEW v11.08: Push entry features and exit profit into the online learner
         background_tasks.add_task(trigger_online_learning_update, payload.asset, payload.profit, payload.entry_score)
         
     return {"status": "logged", "asset": payload.asset}
@@ -619,16 +634,70 @@ async def post_risk_incident(payload: RiskIncidentIn):
 
 
 @app.post(
+    "/missed_trade",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(verify_api_key)],
+    tags=["Telemetry"],
+    summary="Log a Blocked/Vetoed Would-Have-Traded Signal",
+)
+async def post_missed_trade(payload: MissedTradeIn):
+    pool = get_pool()
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO missed_trade_signals
+                (asset, account_type, reason, side, score, raw_score, threshold, rsi,
+                 price, atr, sl_distance, tp_distance, tier2_action, tier2_confidence,
+                 session_hour, magic_number, created_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16, NOW())
+                """,
+                payload.asset, payload.account_type, payload.reason, payload.side,
+                payload.score, payload.raw_score, payload.threshold, payload.rsi,
+                payload.price, payload.atr, payload.sl_distance, payload.tp_distance,
+                payload.tier2_action, payload.tier2_confidence, payload.session_hour,
+                payload.magic_number,
+            )
+    except Exception:
+        logger.exception("Failed to insert missed_trade_signals row for %s", payload.asset)
+        raise HTTPException(status_code=500, detail="Failed to store missed trade signal.")
+
+    logger.info(
+        "MISSED TRADE: %s | %s | side=%s reason=%s score=%.3f raw_score=%.3f threshold=%.3f rsi=%s",
+        payload.account_type, payload.asset, payload.side, payload.reason,
+        payload.score or 0.0, payload.raw_score or 0.0, payload.threshold or 0.0, payload.rsi,
+    )
+
+    await manager.broadcast({
+        "type": "MISSED_TRADE",
+        "asset": payload.asset,
+        "reason": payload.reason,
+        "side": payload.side,
+        "raw_score": payload.raw_score,
+    })
+
+    return {"status": "logged", "asset": payload.asset, "reason": payload.reason}
+
+
+@app.get(
+    "/missed_trades/summary",
+    dependencies=[Depends(verify_api_key)],
+    tags=["Monitoring"],
+    summary="Trend Analysis of Missed/Vetoed Trades by Asset and Reason",
+)
+async def missed_trades_summary(days: int = 7):
+    days = max(1, min(days, 90))
+    summary = await get_missed_trade_summary(days=days)
+    return summary
+
+
+@app.post(
     "/models/reload",
     dependencies=[Depends(verify_api_key)],
     tags=["Control"],
     summary="Force Clear Model Cache",
 )
 async def models_reload():
-    """
-    Force the in-memory model cache to clear so subsequent Tier-2 evaluation
-    will reload models from disk. Useful after manual model swaps/deploys.
-    """
     try:
         clear_model_cache()
         await manager.broadcast({
@@ -702,13 +771,16 @@ async def get_kpis():
                     s.scheduled_start_hour,
                     s.scheduled_end_hour,
                     s.calibration_score,
-                    s.calibration_n
+                    s.calibration_n,
+                    sl.lifeline_score,
+                    sl.terminated AS lifeline_terminated
                 FROM trade_telemetry t
                 FULL OUTER JOIN strategy_db s ON s.asset = t.asset
+                LEFT JOIN strategy_lifeline sl ON sl.asset = COALESCE(s.asset, t.asset)
                 WHERE t.created_at >= NOW() - INTERVAL '30 days' OR t.created_at IS NULL
                 GROUP BY t.asset, s.asset, s.live_approved, s.opt_threshold, s.opt_sl_mult,
                          s.opt_tp_mult, s.scheduled_start_hour, s.scheduled_end_hour,
-                         s.calibration_score, s.calibration_n
+                         s.calibration_score, s.calibration_n, sl.lifeline_score, sl.terminated
                 ORDER BY COALESCE(t.asset, s.asset)
                 """
             )
@@ -788,6 +860,8 @@ async def get_kpis():
                     "scheduled_end_hour": r["scheduled_end_hour"],
                     "calibration_score": float(r["calibration_score"]) if r["calibration_score"] is not None else None,
                     "calibration_n": r["calibration_n"],
+                    "lifeline_score": float(r["lifeline_score"]) if r["lifeline_score"] is not None else None,
+                    "lifeline_terminated": bool(r["lifeline_terminated"]) if r["lifeline_terminated"] is not None else False,
                 }
                 for r in per_asset if r["asset"] is not None
             ],
