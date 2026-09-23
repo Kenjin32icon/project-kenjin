@@ -1,33 +1,10 @@
+# startup/jobs/ml_tier2.py
 """
-Tier 2 Micro-Trigger Classifier (v11.08): Rapid evaluation of tick features
-against Macro LLM bias using a LightGBM Triple 'Neural Map' Engine, now with
-an online-learning layer for faster adaptation and a passthrough of
-`volatility_regime` for the EA's adaptive trading-frequency logic.
-Includes an in-memory caching mechanism and a heuristic fallback for cold starts.
-
-STRATEGIC PROFIT LIFELINE (from v11.07 - unchanged):
-  - The reward regressor ("map_reward.pkl") is trained on EVERY closed trade
-    using a signed, loss-averse utility target.
-  - evaluate_tier2_signal() takes lifeline_multiplier / lifeline_terminated
-    so a per-asset "survival economy" gates and scales the signal.
-
-BIG-DATA / ADAPTIVE-FREQUENCY UPDATE (v11.08):
-  - `volatility_regime` (already computed by feature_pull.py) is now carried
-    through evaluate_tier2_signal()'s return dict and surfaced by
-    orchestrator/main.py's /strategy_params response, so
-    MAPSAR_ProfitEngine.mq5's fast-lane cadence logic has a live read on
-    whether the market is actually moving enough to justify trading faster.
-  - NEW: `OnlineTierUpdater`, a River-based incremental model that updates
-    after every closed trade in O(1) time (no LightGBM refit needed). The
-    full LightGBM retrain (train_neural_maps, run on gatekeeper's ~4h
-    cadence / auto_tester's schedule) remains the source of truth for
-    map_loss/map_profit/map_reward.pkl; the online model produces a fast,
-    continuously-fresh *adjustment* to expected value that's blended in
-    between full retrains, rather than trading raw LightGBM staleness for
-    higher frequency.
-
-Install: pip install river   (LightGBM/joblib/pandas/numpy already required)
+Tier 2 Micro-Trigger Classifier (v11.08 Patched): Uses startup.features as the single
+source for engineered features on small windows pulled from Redis (fast path).
+Ingests missed-trade counterfactual labels and uses recency weighting for retraining cycles.
 """
+
 import os
 import time
 import json
@@ -37,31 +14,35 @@ import logging
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from typing import Dict
+from typing import Dict, List, Optional, Any, Union
+
 from db.redis_client import redis_client
+import startup.features as features
+from startup.jobs.feature_pull import pull_feature_window, pull_feature_window_bulk
+from startup.db import fetch_missed_trade_analytics_rows
+from startup.labeling import compute_recency_weighted_labels
 
 log = logging.getLogger("ml_tier2")
 
 LOSS_AVERSION_FACTOR = 2.5
 _model_cache = {}
 
-_RAW_FLOAT_COLS = ['bid', 'ask', 'tick_volume', 'rsi', 'tema', 'ac', 'sar', 'adx',
-                   'ma10', 'ma20', 'ma50', 'ma100', 'ma200']
+_RAW_FLOAT_COLS = getattr(features, "RAW_NUMERIC_COLS", [
+    'bid', 'ask', 'tick_volume', 'rsi', 'tema', 'ac', 'sar', 'adx',
+    'ma10', 'ma20', 'ma50', 'ma100', 'ma200'
+])
 
 _ONLINE_FEATURES = ['ma_spread_delta', 'price_velocity_1m', 'rsi', 'rvol']
-
-# How much weight the fast online adjustment gets vs the batch LightGBM
-# expected_value. Kept modest and configurable - the online model is a
-# freshness correction, not a replacement for the validated batch model.
 ONLINE_BLEND_WEIGHT = 0.25
 
 
-async def pull_feature_window(symbol: str, window_minutes: int = 15) -> pd.DataFrame:
+# ---------------------
+# Fast Redis-based small-window pull
+# ---------------------
+async def pull_feature_window_redis(symbol: str, window_minutes: int = 15) -> pd.DataFrame:
     """
     Pulls the rolling tick window from Redis (fast path) and computes engineered features.
-    Unchanged from v11.07 - this window is small (~15 min of ticks for one
-    asset) so pandas is not the bottleneck here; the big-data rewrite targets
-    startup/jobs/feature_pull.py's larger Postgres-backed windows instead.
+    Delegates feature engineering to startup.features.base_features() for exact parity.
     """
     redis_key = f"ticks:{symbol}"
     current_time = time.time()
@@ -74,47 +55,46 @@ async def pull_feature_window(symbol: str, window_minutes: int = 15) -> pd.DataF
 
     parsed_ticks = [json.loads(tick) for tick in raw_ticks]
     df = pd.DataFrame(parsed_ticks)
-    if df.empty:
+
+    if len(df) == 0:
         return df
 
+    # Ensure numeric raw columns present and cast to float using canonical list
     for col in _RAW_FLOAT_COLS:
         if col in df.columns:
-            df[col] = df[col].astype(float)
+            try:
+                df[col] = df[col].astype(float)
+            except Exception:
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype(float).fillna(0.0)
         else:
             df[col] = 0.0
 
+    # Normalize timestamps and sort
     if 'ts' in df.columns:
-        df['ts_dt'] = pd.to_datetime(df['ts'], unit='s')
+        df['ts'] = pd.to_datetime(df['ts'], unit='s', utc=True, errors='coerce')
     else:
-        df['ts_dt'] = pd.to_datetime(pd.Series(range(len(df))), unit='s')
-    df = df.sort_values('ts_dt').reset_index(drop=True)
+        df['ts'] = pd.to_datetime(pd.Series(range(len(df))), unit='s', utc=True)
+    df = df.sort_values('ts').reset_index(drop=True)
 
-    df['mid'] = (df['bid'] + df['ask']) / 2.0
-    df['dt_sec'] = df['ts_dt'].diff().dt.total_seconds().fillna(1.0)
-    df['dt_sec'] = np.where(df['dt_sec'] <= 0, 1.0, df['dt_sec'])
-
-    df['price_velocity_1m'] = df['mid'].diff(periods=12).fillna(0.0) / df['dt_sec'].rolling(12).sum().fillna(1.0)
-    df['price_velocity_5m'] = df['mid'].diff(periods=60).fillna(0.0) / df['dt_sec'].rolling(60).sum().fillna(1.0)
-
-    df['ma_spread'] = df['ma10'] - df['ma50']
-    df['ma_spread_delta'] = df['ma_spread'] - df['ma_spread'].shift(5).fillna(0.0)
-
-    mean_vol = df['tick_volume'].rolling(window=30, min_periods=1).mean()
-    df['rvol'] = np.where(mean_vol > 0, df['tick_volume'] / mean_vol, 1.0)
-
-    rolling_std = df['mid'].rolling(window=20, min_periods=1).std().fillna(0.0)
-    rolling_mean = df['mid'].rolling(window=20, min_periods=1).mean().fillna(1.0)
-    df['volatility_regime'] = (rolling_std / rolling_mean) * 10000.0
-
-    return df
+    coerced = features.coerce_frame(df)
+    engineered = features.base_features(coerced)
+    return engineered
 
 
+# ---------------------
+# Micro trend calculation
+# ---------------------
 def compute_micro_trend(df: pd.DataFrame) -> dict:
-    """Short-horizon (~1-2 minute) statistical trend read independent of macro models. Unchanged."""
-    if df.empty or len(df) < 5:
+    """Short-horizon (~1-2 minute) statistical trend read using base_features."""
+    if df is None or len(df) < 5:
         return {"micro_trend": "NEUTRAL", "micro_trend_strength": 0.0}
 
-    latest = df.iloc[-1]
+    base = features.base_features(features.coerce_frame(df))
+    if base is None or len(base) < 1:
+        return {"micro_trend": "NEUTRAL", "micro_trend_strength": 0.0}
+
+    latest = base.iloc[-1]
+
     v1m = float(latest.get('price_velocity_1m', 0.0))
     ma_delta = float(latest.get('ma_spread_delta', 0.0))
     rvol = float(latest.get('rvol', 1.0))
@@ -142,8 +122,10 @@ def compute_micro_trend(df: pd.DataFrame) -> dict:
     return {"micro_trend": trend, "micro_trend_strength": round(strength, 3)}
 
 
+# ---------------------
+# Models loading / caching
+# ---------------------
 def get_models():
-    """Load models into memory on-demand and cache them. Unchanged."""
     global _model_cache
     if _model_cache:
         return _model_cache
@@ -173,35 +155,40 @@ def compute_reward_utility(profit: pd.Series) -> pd.Series:
     return np.where(profit >= 0, profit, profit * LOSS_AVERSION_FACTOR)
 
 
-def train_neural_maps(telemetry_df: pd.DataFrame, risk_value: float = 1.0, opt_threshold: float = 0.1) -> bool:
-    """Batch LightGBM training - unchanged from v11.07 (source of truth model)."""
+def train_neural_maps(
+    telemetry_df: pd.DataFrame,
+    risk_value: float = 1.0,
+    opt_threshold: float = 0.1,
+    sample_weight: Optional[Union[pd.Series, np.ndarray]] = None,
+) -> bool:
+    """Batch LightGBM training supporting recency sample weights."""
     global _model_cache
 
-    if telemetry_df.empty or 'profit' not in telemetry_df.columns:
+    if len(telemetry_df) == 0 or 'profit' not in telemetry_df.columns:
         return False
 
     telemetry_df['is_loss'] = (telemetry_df['profit'] < 0).astype(int)
     telemetry_df['is_profit'] = (telemetry_df['profit'] > 0).astype(int)
     telemetry_df['reward_utility'] = compute_reward_utility(telemetry_df['profit'])
 
-    features = _ONLINE_FEATURES
-    for f in features:
+    features_list = _ONLINE_FEATURES
+    for f in features_list:
         if f not in telemetry_df.columns:
             telemetry_df[f] = 0.0
     telemetry_df.fillna(0, inplace=True)
 
-    X = telemetry_df[features]
+    X = telemetry_df[features_list]
 
     y_loss = telemetry_df['is_loss']
     clf_loss = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05, class_weight='balanced')
-    clf_loss.fit(X, y_loss)
+    clf_loss.fit(X, y_loss, sample_weight=sample_weight)
 
     y_profit = telemetry_df['is_profit']
     clf_profit = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05, class_weight='balanced')
-    clf_profit.fit(X, y_profit)
+    clf_profit.fit(X, y_profit, sample_weight=sample_weight)
 
     reg_reward = lgb.LGBMRegressor(n_estimators=150, learning_rate=0.05)
-    reg_reward.fit(X, telemetry_df['reward_utility'])
+    reg_reward.fit(X, telemetry_df['reward_utility'], sample_weight=sample_weight)
 
     os.makedirs('models', exist_ok=True)
     mapping = {'map_loss.pkl': clf_loss, 'map_profit.pkl': clf_profit, 'map_reward.pkl': reg_reward}
@@ -229,29 +216,37 @@ def train_neural_maps(telemetry_df: pd.DataFrame, risk_value: float = 1.0, opt_t
         return False
 
 
-# ---------------------------------------------------------------------------
-# NEW v11.08: online / incremental learning layer (River)
-# ---------------------------------------------------------------------------
+# ---------------------
+# Retrain Execution Cycle
+# ---------------------
+async def run_retrain_cycle(limit: int = 10000) -> bool:
+    """
+    Ingests missed-trade counterfactual labels with recency weighting,
+    pulls engineered feature windows, and retrains LightGBM models.
+    """
+    missed = await fetch_missed_trade_analytics_rows(limit=limit)
+    labels = compute_recency_weighted_labels(missed) if missed else []
+    log.info("ml_tier2: retrain cycle started. missed=%d labels=%d", len(missed), len(labels))
+
+    if not labels:
+        log.warning("ml_tier2: no counterfactual labels generated. Retrain cycle skipped.")
+        return False
+
+    df_augmented = pd.DataFrame(labels) if isinstance(labels, list) else labels
+    sample_weight = df_augmented.get('weight', None) if 'weight' in df_augmented.columns else None
+
+    success = train_neural_maps(df_augmented, sample_weight=sample_weight)
+    return success
+
+
+# ---------------------
+# OnlineTierUpdater
+# ---------------------
 class OnlineTierUpdater:
-    """
-    Incremental expected-value adjustment model. Updates in O(1) per closed
-    trade (no refit of the whole dataset), so the signal can react to intraday
-    regime shifts well before the next scheduled LightGBM retrain.
-
-    This deliberately predicts a *residual* against the batch model's
-    expected_value (actual reward_utility - batch e_utility), not profit
-    directly - it's a correction layer, not a second source of truth. That
-    keeps a misbehaving/underfit online model from being able to push the
-    combined signal far from what the validated batch model says.
-    """
-
     def __init__(self, redis_state_key_prefix: str = "online_tier2_model"):
         from river import linear_model, preprocessing, optim
-
         self._prefix = redis_state_key_prefix
-        self.model = preprocessing.StandardScaler() | linear_model.LinearRegression(
-            optimizer=optim.SGD(lr=0.01)
-        )
+        self.model = preprocessing.StandardScaler() | linear_model.LinearRegression(optimizer=optim.SGD(lr=0.01))
 
     def predict_adjustment(self, features: Dict[str, float]) -> float:
         try:
@@ -268,7 +263,6 @@ class OnlineTierUpdater:
             log.exception("OnlineTierUpdater learn_one failed")
 
     async def persist(self) -> None:
-        """Serialize model state to Redis so it survives orchestrator restarts."""
         import pickle
         await redis_client.set(f"{self._prefix}:state", pickle.dumps(self.model))
 
@@ -285,35 +279,45 @@ class OnlineTierUpdater:
         return inst
 
 
-# Module-level singleton, lazily populated by orchestrator startup (lifespan
-# hook) via `await OnlineTierUpdater.load()`. Kept as a plain global (like
-# _model_cache above) to match this file's existing style rather than
-# introducing a DI framework for one object.
-_online_updater: "OnlineTierUpdater | None" = None
+_online_updater: Optional[OnlineTierUpdater] = None
 
 
-def set_online_updater(updater: "OnlineTierUpdater") -> None:
+def set_online_updater(updater: OnlineTierUpdater) -> None:
     global _online_updater
     _online_updater = updater
 
 
-def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: float, opt_threshold: float,
-                          risk_value: float = 1.0, calibration_multiplier: float = 1.0,
-                          lifeline_multiplier: float = 1.0, lifeline_terminated: bool = False) -> dict:
-    """
-    Evaluates real-time ticks using the Triple Neural Map with EV veto logic,
-    calibration, lifeline gating, and (v11.08) an online-learning EV
-    adjustment + volatility_regime passthrough for the EA's adaptive
-    trading-frequency ("fast lane") logic.
-    """
+# ---------------------
+# Tier2 Signal Evaluation
+# ---------------------
+def evaluate_tier2_signal(
+    df: pd.DataFrame,
+    bullish_prob: float,
+    bearish_prob: float,
+    opt_threshold: float,
+    risk_value: float = 1.0,
+    calibration_multiplier: float = 1.0,
+    lifeline_multiplier: float = 1.0,
+    lifeline_terminated: bool = False,
+) -> dict:
+    """Evaluates ticks using batch models and startup.features.base_features()."""
     if lifeline_terminated:
-        return {"action": "HOLD", "confidence": 0.0, "lot_multiplier": 0.0,
-                "lifeline_terminated": True, "volatility_regime": 0.0}
+        return {
+            "action": "HOLD",
+            "confidence": 0.0,
+            "lot_multiplier": 0.0,
+            "lifeline_terminated": True,
+            "volatility_regime": 0.0,
+        }
 
-    if df.empty or len(df) < 5:
+    if df is None or len(df) < 5:
         return {"action": "HOLD", "confidence": 0.0, "lot_multiplier": 1.0, "volatility_regime": 0.0}
 
-    latest = df.iloc[-1]
+    base = features.base_features(features.coerce_frame(df))
+    if base is None or len(base) < 1:
+        return {"action": "HOLD", "confidence": 0.0, "lot_multiplier": 1.0, "volatility_regime": 0.0}
+
+    latest = base.iloc[-1]
     volatility_regime = float(latest.get('volatility_regime', 0.0))
     features_dict = {
         'ma_spread_delta': float(latest.get('ma_spread_delta', 0.0)),
@@ -322,19 +326,14 @@ def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: f
         'rvol': float(latest.get('rvol', 1.0)),
     }
 
-    current_features_df = pd.DataFrame([features_dict])
     models = get_models()
 
     if models:
+        current_features_df = pd.DataFrame([features_dict])
         p_loss = models['loss'].predict_proba(current_features_df)[0][1]
         p_profit = models['profit'].predict_proba(current_features_df)[0][1]
         e_utility = models['reward'].predict(current_features_df)[0]
 
-        # v11.08: blend in the fast online-learning residual adjustment, if
-        # a persisted online model is available. This is what lets the
-        # expected-value gate react to an emerging intraday regime shift
-        # without waiting for the next scheduled LightGBM retrain -
-        # supporting higher, but still EV-gated, trading frequency.
         online_adjustment = 0.0
         if _online_updater is not None:
             online_adjustment = _online_updater.predict_adjustment(features_dict)
@@ -401,16 +400,16 @@ def evaluate_tier2_signal(df: pd.DataFrame, bullish_prob: float, bearish_prob: f
         }
 
 
-async def record_closed_trade_for_online_learning(features: Dict[str, float], batch_e_utility: float,
-                                                    actual_profit: float) -> None:
-    """
-    Call this from wherever v11.07 already records a closed trade's outcome
-    (e.g. the same place trade_telemetry gets the closing profit written).
-    Updates the online model in O(1) and persists it to Redis every call -
-    cheap enough at trade-close frequency, not per-tick.
-    """
+# ---------------------
+# Online Learning Telemetry Record
+# ---------------------
+async def record_closed_trade_for_online_learning(
+    features_map: Dict[str, float],
+    batch_e_utility: float,
+    actual_profit: float,
+) -> None:
     if _online_updater is None:
         return
     actual_reward_utility = compute_reward_utility(pd.Series([actual_profit]))[0]
-    _online_updater.learn(features, batch_e_utility, float(actual_reward_utility))
+    _online_updater.learn(features_map, batch_e_utility, float(actual_reward_utility))
     await _online_updater.persist()
