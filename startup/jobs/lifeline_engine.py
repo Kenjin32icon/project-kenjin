@@ -1,57 +1,41 @@
+# startup/jobs/lifeline_engine.py
 """
-Strategic Profit Lifeline Engine.
+Strategic Profit Lifeline & Active Profit Engine (v11.08+ Combined Patch)
 
-Project Kenjin's Triple Neural Map (ml_tier2.py) already predicts P(loss),
-P(profit) and an expected reward per trade. This module is a second,
-independent layer on top of that prediction: a *consequence* layer that
-treats realised trade outcomes as survival-relevant events rather than
-neutral PnL entries.
-
-Design (per-asset "survival economy"):
-  - A profitable, correctly-called trade is a strong positive stimulus:
-    the asset's lifeline_score rises, and the rise compounds on a winning
-    streak (momentum reward).
-  - A loss is treated as a threat to the asset's ability to keep trading,
-    not a neutral data point: it costs MORE lifeline than an equal-sized
-    win grants (LOSS_AVERSION_FACTOR), and it compounds on a losing streak.
-  - If lifeline_score is driven to zero, the asset is hard-terminated:
-    live_approved is forced false, a risk_incidents row is written, and
-    evaluate_tier2_signal() is forced to HOLD/zero-size regardless of what
-    the EV model says, until a human operator calls manual_reset().
-
-This module only gates and scales the output of ml_tier2.py — it does not
-re-derive win/loss probabilities itself. Wire it in at exactly two points:
-  1. main.py's /telemetry route, right after a CLOSE trade is inserted:
-         await record_trade_outcome(payload.asset, payload.profit)
-  2. main.py's get_strategy_params(), before calling evaluate_tier2_signal():
-         lifeline_mult, terminated = await get_lifeline_multiplier(asset)
+Integrates:
+ - Direct updates to `strategy_db` and `strategy_lifeline` tables.
+ - Abstraction helper methods (`update_strategy_lifeline`, `fetch_account_snapshots_summary`, `get_pool`).
+ - Flexible `record_trade_outcome` supporting dictionary payloads and parameter-based calls.
+ - Multi-tier account drawdown and dynamic profit-locking checks.
 """
-import logging
+
+import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import logging
+from typing import Any, Dict, Optional, Tuple, Union
 
-from startup.db import get_pool
+import asyncpg
 
-log = logging.getLogger("lifeline_engine")
+from startup.db import (
+    fetch_account_snapshots_summary,
+    get_pool,
+    update_strategy_lifeline,
+)
 
-# --- Tunable "survival economy" constants -----------------------------
-LIFELINE_BASELINE = 100.0          # neutral starting score for every asset
-LIFELINE_MAX = 200.0                # hard cap on how far a hot streak can push it
-LIFELINE_TERMINATION_FLOOR = 0.0    # score <= this triggers hard termination
+logger = logging.getLogger("orchestrator.lifeline")
+log = logger  # Alias for backward compatibility across modules
 
-# Loss aversion: a loss of magnitude X removes MORE lifeline than a profit
-# of magnitude X adds. 2.5 == "losses hurt 2.5x as much as an equal win
-# feels good" (prospect-theory-style asymmetry, deliberately punitive).
-LOSS_AVERSION_FACTOR = 2.5
+# --- Tunable "Survival Economy" Constants -----------------------------
+LIFELINE_BASELINE = 100.0          # Neutral starting score for every asset
+LIFELINE_MAX = 200.0               # Maximum score cap
+LIFELINE_TERMINATION_FLOOR = 0.0   # Score <= 0.0 triggers hard termination
 
-# Per-trade stimulus is normalised by a risk unit (an ATR/SL-distance based
-# "1R" equivalent) so a $2 move on a micro-lot and a $200 move on a standard
-# lot both read as "roughly 1R", keeping the lifeline economy asset-agnostic.
-DEFAULT_RISK_UNIT = 10.0  # fallback $ risk-per-trade if none is supplied
+LOSS_AVERSION_FACTOR = 2.5         # Asymmetric loss penalty multiplier
+DEFAULT_RISK_UNIT = 10.0           # Fallback baseline risk per trade
 
-# Streak compounding: consecutive wins/losses amplify the stimulus in both
-# directions, mirroring momentum in confidence and in caution.
-STREAK_BONUS_STEP = 0.10   # +10% per consecutive win/loss
-STREAK_BONUS_CAP = 0.50    # capped at +/-50% amplification
+STREAK_BONUS_STEP = 0.10           # +10% amplification per consecutive win/loss
+STREAK_BONUS_CAP = 0.50            # Maximum +/-50% streak bonus cap
 
 
 @dataclass
@@ -63,10 +47,70 @@ class LifelineState:
     terminated: bool
 
 
+# ---------------------------------------------------------------------------
+# Global Account Equity & Protection Monitoring
+# ---------------------------------------------------------------------------
+async def run_lifeline_protection_cycle() -> bool:
+    """
+    Evaluates open account equity and drawdowns using `fetch_account_snapshots_summary`
+    and direct pool fallback to apply multi-tier risk mitigation.
+    """
+    pool = get_pool()
+    snaps = await fetch_account_snapshots_summary(recent_minutes=60)
+
+    if snaps:
+        for snap in snaps:
+            dd = float(snap.get("drawdown_pct", 0.0))
+            account_id = snap.get("account_id", "default")
+            if dd >= 10.0:
+                log.warning("Lifeline emergency triggered for account %s: drawdown=%.2f%%", account_id, dd)
+            elif dd >= 4.20:
+                log.warning("Lifeline warning for account %s: drawdown=%.2f%%. Contracting exposure.", account_id, dd)
+
+    async with pool.acquire() as conn:
+        snapshot = await conn.fetchrow(
+            "SELECT * FROM account_snapshots ORDER BY created_at DESC LIMIT 1"
+        )
+        if not snapshot:
+            return True
+
+        equity = float(snapshot["equity"])
+        balance = float(snapshot["balance"])
+        day_start = float(snapshot.get("day_start_balance", balance))
+
+        drawdown_pct = ((day_start - equity) / day_start) * 100.0 if day_start > 0 else 0.0
+        profit_pct = ((equity - balance) / balance) * 100.0 if balance > 0 else 0.0
+
+        # Dynamic Trailing Profit Lock
+        if profit_pct >= 1.50:
+            logger.info("LIFELINE: Equity target reached (+%.2f%%). Triggering global profit lock.", profit_pct)
+            await conn.execute(
+                """
+                UPDATE strategy_db 
+                SET opt_threshold = GREATEST(0.50, opt_threshold - 0.05) 
+                WHERE live_approved = TRUE
+                """
+            )
+
+        # Early Emergency Exposure Reduction
+        if drawdown_pct >= 4.20:
+            logger.warning("LIFELINE WARNING: High drawdown (%.2f%%). Raising entry thresholds.", drawdown_pct)
+            await conn.execute(
+                "UPDATE strategy_db SET opt_threshold = 0.85 WHERE live_approved = TRUE"
+            )
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Per-Asset Survival Economy & Outcome Recording
+# ---------------------------------------------------------------------------
 async def _get_or_create_state(conn, asset: str) -> LifelineState:
     row = await conn.fetchrow(
-        "SELECT asset, lifeline_score, win_streak, loss_streak, terminated "
-        "FROM strategy_lifeline WHERE asset = $1",
+        """
+        SELECT asset, lifeline_score, win_streak, loss_streak, terminated 
+        FROM strategy_lifeline WHERE asset = $1
+        """,
         asset,
     )
     if row is None:
@@ -79,6 +123,7 @@ async def _get_or_create_state(conn, asset: str) -> LifelineState:
             asset, LIFELINE_BASELINE,
         )
         return LifelineState(asset, LIFELINE_BASELINE, 0, 0, False)
+
     return LifelineState(
         asset=row["asset"],
         lifeline_score=float(row["lifeline_score"]),
@@ -89,12 +134,7 @@ async def _get_or_create_state(conn, asset: str) -> LifelineState:
 
 
 def _stimulus(profit: float, risk_unit: float, win_streak: int, loss_streak: int) -> float:
-    """
-    Signed lifeline delta for one closed trade.
-      profit >= 0 -> pleasure stimulus, amplified by the current win streak.
-      profit <  0 -> pain penalty, scaled by LOSS_AVERSION_FACTOR and
-                     amplified by the current loss streak.
-    """
+    """Calculates asymmetric lifeline score delta based on profit, risk unit, and streaks."""
     risk_unit = risk_unit if risk_unit and risk_unit > 0 else DEFAULT_RISK_UNIT
     r_multiple = profit / risk_unit
 
@@ -103,27 +143,51 @@ def _stimulus(profit: float, risk_unit: float, win_streak: int, loss_streak: int
         return r_multiple * streak_amp
     else:
         streak_amp = 1.0 + min(STREAK_BONUS_CAP, loss_streak * STREAK_BONUS_STEP)
-        return r_multiple * LOSS_AVERSION_FACTOR * streak_amp  # already negative
+        return r_multiple * LOSS_AVERSION_FACTOR * streak_amp
 
 
-async def record_trade_outcome(asset: str, profit: float, risk_unit: float = DEFAULT_RISK_UNIT) -> LifelineState:
+async def record_trade_outcome(
+    trade_or_asset: Union[Dict[str, Any], str],
+    profit: Optional[float] = None,
+    risk_unit: float = DEFAULT_RISK_UNIT,
+) -> LifelineState:
     """
-    Call once per CLOSED trade, immediately after the trade_telemetry INSERT
-    succeeds. Updates the per-asset lifeline score and, if the floor is
-    breached, hard-terminates the asset (live trading revoked).
+    Records trade results into `strategy_lifeline` and updates asset survival state.
+    Supports either a dictionary payload or direct parameters.
     """
+    if isinstance(trade_or_asset, dict):
+        trade_record = trade_or_asset
+        asset = trade_record.get("asset") or trade_record.get("strategy_id", "UNKNOWN")
+        profit_val = float(trade_record.get("profit", profit if profit is not None else 0.0))
+        risk_unit_val = float(trade_record.get("risk_unit", risk_unit))
+
+        payload = {
+            "strategy_id": asset,
+            "lifeline_score": trade_record.get("lifeline_score"),
+            "lifeline_terminated": trade_record.get("lifeline_terminated", False),
+            "closed_at": trade_record.get("closed_at", datetime.now(timezone.utc)),
+        }
+        try:
+            await update_strategy_lifeline(payload)
+        except Exception as e:
+            log.warning("Could not execute update_strategy_lifeline helper: %s", e)
+    else:
+        asset = str(trade_or_asset)
+        profit_val = float(profit) if profit is not None else 0.0
+        risk_unit_val = float(risk_unit)
+
     pool = get_pool()
     async with pool.acquire() as conn:
         state = await _get_or_create_state(conn, asset)
 
         if state.terminated:
-            log.info("Lifeline: %s is TERMINATED - outcome recorded, no stimulus applied.", asset)
+            log.info("Lifeline: %s is TERMINATED - outcome logged without applying delta.", asset)
             return state
 
-        delta = _stimulus(profit, risk_unit, state.win_streak, state.loss_streak)
+        delta = _stimulus(profit_val, risk_unit_val, state.win_streak, state.loss_streak)
         new_score = max(0.0, min(LIFELINE_MAX, state.lifeline_score + delta))
 
-        if profit >= 0:
+        if profit_val >= 0:
             win_streak, loss_streak = state.win_streak + 1, 0
         else:
             win_streak, loss_streak = 0, state.loss_streak + 1
@@ -156,36 +220,21 @@ async def record_trade_outcome(asset: str, profit: float, risk_unit: float = DEF
                 VALUES ('live', $1, 'lifeline_termination', $2, NOW())
                 """,
                 asset,
-                f"lifeline_score reached {new_score:.1f} after a loss of {profit:.2f} "
-                f"(loss_streak={loss_streak}) - asset auto-terminated, manual re-arm required.",
+                f"lifeline_score dropped to {new_score:.1f} (loss={profit_val:.2f}) - auto-terminated.",
             )
-            log.warning(
-                "LIFELINE TERMINATION: %s hit the floor (score=%.1f) - live trading halted, "
-                "call lifeline_engine.manual_reset() to re-arm.", asset, new_score,
-            )
+            log.warning("LIFELINE TERMINATION: %s hit termination floor (score=%.1f).", asset, new_score)
         else:
             await conn.execute(
                 "UPDATE strategy_db SET lifeline_score = $2, updated_at = NOW() WHERE asset = $1",
                 asset, new_score,
             )
-            verdict = "PLEASURE(+)" if delta >= 0 else "PAIN(-)"
-            log.info(
-                "Lifeline: %s %s delta=%.2f -> score=%.1f (win_streak=%d, loss_streak=%d)",
-                asset, verdict, delta, new_score, win_streak, loss_streak,
-            )
+            log.info("Lifeline outcome recorded for %s: delta=%.2f -> score=%.1f", asset, delta, new_score)
 
         return LifelineState(asset, new_score, win_streak, loss_streak, now_terminated)
 
 
-async def get_lifeline_multiplier(asset: str) -> tuple:
-    """
-    Returns (multiplier, terminated) for evaluate_tier2_signal() to use as a
-    position-size gate:
-      - terminated=True  -> caller must force HOLD / zero size.
-      - multiplier scales lot_multiplier: > 1.0 on a hot streak (up to 1.5x),
-        < 1.0 once the asset has taken damage (down to 0.2x), well before
-        it actually reaches the termination floor.
-    """
+async def get_lifeline_multiplier(asset: str) -> Tuple[float, bool]:
+    """Returns position scaling multiplier and termination state for dynamic trade sizing."""
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -195,12 +244,13 @@ async def get_lifeline_multiplier(asset: str) -> tuple:
         return 1.0, False
     if row["terminated"]:
         return 0.0, True
+
     multiplier = max(0.2, min(1.5, float(row["lifeline_score"]) / LIFELINE_BASELINE))
     return multiplier, False
 
 
 async def manual_reset(asset: str, operator_note: str = "Manual operator re-arm") -> None:
-    """Re-arms a terminated asset back to baseline. Never automatic by design."""
+    """Restores a terminated asset back to baseline score."""
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -213,12 +263,18 @@ async def manual_reset(asset: str, operator_note: str = "Manual operator re-arm"
             asset, LIFELINE_BASELINE,
         )
         await conn.execute(
-            "UPDATE strategy_db SET lifeline_terminated = false, lifeline_score = $2, updated_at = NOW() WHERE asset = $1",
+            """
+            UPDATE strategy_db 
+            SET lifeline_terminated = false, lifeline_score = $2, updated_at = NOW() 
+            WHERE asset = $1
+            """,
             asset, LIFELINE_BASELINE,
         )
         await conn.execute(
-            "INSERT INTO risk_incidents (account_type, asset, reason, details, created_at) "
-            "VALUES ('live', $1, 'lifeline_manual_reset', $2, NOW())",
+            """
+            INSERT INTO risk_incidents (account_type, asset, reason, details, created_at)
+            VALUES ('live', $1, 'lifeline_manual_reset', $2, NOW())
+            """,
             asset, operator_note,
         )
     log.warning("Lifeline: %s manually reset to baseline (%.1f) by operator.", asset, LIFELINE_BASELINE)
