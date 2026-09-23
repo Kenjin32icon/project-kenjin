@@ -29,4 +29,6 @@ typing_extensions==4.16.0
 tzlocal==5.4.4
 uvicorn[standard]==0.52.1
 websockets
-polars pyarrow river --break-system-packages
+polars
+pyarrow
+river
