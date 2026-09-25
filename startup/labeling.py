@@ -1,3 +1,4 @@
+# startup/labeling.py
 """
 startup/labeling.py  (v11.09)
 =============================
@@ -246,3 +247,39 @@ def recency_weights(t_entry: np.ndarray, half_life_days: float) -> np.ndarray:
         return np.ones(len(t_entry))
     age_days = (np.max(t_entry) - t_entry) / 86400.0
     return np.power(0.5, age_days / half_life_days)
+
+
+def compute_recency_weighted_labels(
+    df: pd.DataFrame,
+    label_col: str = "target",
+    half_life: int = 1000,
+    weight_col_name: str = "recency_weight",
+) -> pd.DataFrame:
+    """
+    Computes exponential decay weights for historical data to prioritize recent
+    market behavior in ML model training.
+
+    Args:
+        df: The dataset containing features and labels.
+        label_col: The column containing the target variable to be modeled.
+        half_life: The number of periods/rows it takes for the weight to halve.
+        weight_col_name: The name of the output weight column.
+
+    Returns:
+        pd.DataFrame: The dataframe with the new recency weight column appended.
+    """
+    if df.empty:
+        return df
+
+    # Create an array of sequential steps from the oldest (0) to the newest (N)
+    steps = np.arange(len(df))
+
+    # Calculate exponential decay weights based on the half-life
+    decay_rate = np.log(2) / half_life
+    weights = np.exp(decay_rate * (steps - steps.max()))
+
+    # Normalize weights so the maximum weight for the most recent observation is 1.0
+    df = df.copy()
+    df[weight_col_name] = weights / weights.max()
+
+    return df
