@@ -685,6 +685,16 @@ function connectWebSocket() {
             fetchKpis();
         }
 
+        if (payload.type === "GUARDIAN_ACTION") {
+            logConsole(`[GUARDIAN] ${payload.action} ${payload.asset} #${payload.ticket} R=${payload.r_multiple} (${payload.reason})`, payload.action === "CLOSE" ? "warn" : "info");
+            fetchKpis();
+        }
+
+        if (payload.type === "MARKET_CONTEXT") {
+            document.getElementById("live-trend").innerText = payload.regime || "—";
+            logConsole(`[MARKET] ${payload.summary || "Context updated"}`, payload.fresh ? "info" : "warn");
+        }
+
         // NEW: pushed by POST /control/drawdown_halt so every connected
         // dashboard (not just the one that clicked the button) reflects the
         // new halt state immediately, without waiting for the next poll.
@@ -771,6 +781,7 @@ async function fetchHealth() {
         dotApi.className = data.db === "ok" ? "dot online" : "dot offline";
         dotRedis.className = data.redis === "ok" ? "dot online" : "dot offline";
         dotGroq.className = data.groq === "configured" ? "dot online" : "dot degraded";
+        if (data.yahoo && data.yahoo !== "ok") logConsole(`[YAHOO] Market context ${data.yahoo}; bias will be neutral when stale.`, "warn");
 
         // MT5 dot: "online" only if an account_snapshot arrived recently
         // (EA is actively posting), "degraded" if it's stale, "offline" if

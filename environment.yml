@@ -1,15 +1,4 @@
-# environment.yml — Miniconda environment for Project Kenjin's orchestrator
-# and ML jobs (numpy/pandas/lightgbm/scikit-learn), sourced from
-# conda-forge only (never the `defaults` channel, to avoid Anaconda's
-# commercial ToS on the free "defaults" channel).
-#
-# Create:   conda env create -f environment.yml
-# Update:   conda env update -f environment.yml --prune
-# Activate: conda activate kenjin
-#
-# See PROJECT_KENJIN_REFACTOR_PLAN.md, section "Miniconda research", for why
-# this is offered as an alternative to orchestrator/.venv rather than a
-# replacement for it - both are supported by start_kenjin.sh via USE_CONDA=1.
+# Conda alternative to orchestrator/.venv. All channels are conda-forge.
 name: kenjin
 channels:
   - conda-forge
@@ -17,19 +6,24 @@ channels:
 dependencies:
   - python=3.11
   - pip
-  - numpy=2.4.*
-  - pandas=3.0.*
-  - scikit-learn=1.4.*
-  - lightgbm=4.3.*          # conda-forge build links OpenMP + optimized BLAS out of the box
-  - libblas=*=*openblas     # pin the BLAS backend explicitly for reproducibility across machines
-  - redis-py=5.*
-  - asyncpg=0.31.*
-  - postgresql=16.*         # bundles psql/pg_dump/pg_restore client tools for scripts/migrate_supabase_to_local.sh
+  - numpy>=1.26,<2
+  - pandas>=2.2,<3
+  - scikit-learn>=1.5,<2
+  - lightgbm>=4.3,<5
+  - joblib>=1.3,<2
+  - polars>=1,<2
+  - redis-py>=5,<7
+  - asyncpg>=0.29,<1
+  - postgresql=16.*
   - pip:
-    - fastapi==0.141.1
-    - uvicorn[standard]==0.52.1
-    - APScheduler==3.11.3
-    - pydantic==2.13.4
-    - python-dotenv==1.2.2
-    - groq==1.6.0
-    - websockets
+    - fastapi>=0.115,<1
+    - uvicorn[standard]>=0.30,<1
+    - APScheduler>=3.10,<4
+    - pydantic>=2.8,<3
+    - python-dotenv>=1,<2
+    - groq>=1,<2
+    - httpx>=0.27,<1
+    - river>=0.21,<1
+    - yfinance>=0.2.66,<1
+    - websockets>=12,<16
+    - pytest>=8,<10

@@ -36,7 +36,7 @@ MIN_WIN_RATE = float(os.environ.get("GATEKEEPER_MIN_WIN_RATE", 55.0))
 MIN_PROFIT_FACTOR = float(os.environ.get("GATEKEEPER_MIN_PROFIT_FACTOR", 1.3))
 LOOKBACK_DAYS = int(os.environ.get("GATEKEEPER_LOOKBACK_DAYS", 7))
 
-ALLOW_SIMULATED = str(os.environ.get("GATEKEEPER_ALLOW_SIMULATED", "true")).lower() in ("1", "true", "yes")
+ALLOW_SIMULATED = str(os.environ.get("GATEKEEPER_ALLOW_SIMULATED", "false")).lower() in ("1", "true", "yes")
 INCLUDE_DEMO_TRADES = str(os.environ.get("GATEKEEPER_INCLUDE_DEMO_TRADES", "false")).lower() in ("1", "true", "yes")
 RELAX_MIN_SAMPLE = str(os.environ.get("GATEKEEPER_RELAX_MIN_SAMPLE", "false")).lower() in ("1", "true", "yes")
 RELAXED_MIN_SAMPLE = int(os.environ.get("GATEKEEPER_RELAXED_MIN_SAMPLE", "15"))
@@ -53,16 +53,17 @@ async def get_or_reset_daily_baseline(pool: asyncpg.Pool, account_type: str, cur
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT day_start_balance, created_at 
-            FROM account_snapshots 
-            WHERE account_type = $1 
-            ORDER BY created_at DESC LIMIT 1
+            SELECT day_start_balance, ts
+            FROM account_snapshots
+            WHERE account_type = $1
+            ORDER BY ts DESC LIMIT 1
             """,
             account_type,
         )
 
-        if not row or row["created_at"].astimezone(timezone.utc) < today_start:
-            logger.info(f"UTC Midnight Reset: Baseline updated for {account_type} to ${current_balance:,.2f}")
+        if (not row or row["ts"].astimezone(timezone.utc) < today_start
+                or row["day_start_balance"] is None or float(row["day_start_balance"]) <= 0):
+            logger.info("UTC baseline refreshed for %s to %.2f", account_type, current_balance)
             return current_balance
 
         return float(row["day_start_balance"])
@@ -108,10 +109,10 @@ async def evaluate_gatekeeper_signal(
             async with pool.acquire() as conn:
                 await conn.execute(
                     """
-                    INSERT INTO risk_incidents (account_type, asset, incident_type, day_loss_pct, cap)
-                    VALUES ($1, $2, 'daily_loss_limit', $3, $4)
+                    INSERT INTO risk_incidents (account_type, asset, reason, details)
+                    VALUES ($1, $2, 'daily_loss_limit', $3)
                     """,
-                    account_type, asset, day_loss_pct, HARD_CAP_PCT
+                    account_type, asset, f"day_loss_pct={day_loss_pct:.2f} cap={HARD_CAP_PCT:.2f}"
                 )
             return {"approved": False, "action": "veto", "reason": "daily_loss_limit"}
 
@@ -127,17 +128,25 @@ async def evaluate_gatekeeper_signal(
     opt_threshold = float(params.get("opt_threshold", 0.60))
     rsi_buy_max = float(params.get("rsi_buy_max", 70.0))
     rsi_sell_min = float(params.get("rsi_sell_min", 30.0))
-    start_hr = int(params.get("scheduled_start_hour", 0))
-    end_hr = int(params.get("scheduled_end_hour", 23))
+    start_value = params.get("scheduled_start_hour")
+    end_value = params.get("scheduled_end_hour")
+    schedule_configured = start_value is not None and end_value is not None
+    start_hr = int(start_value) if schedule_configured else 0
+    end_hr = int(end_value) if schedule_configured else 23
 
     eval_rsi = rsi if rsi is not None else params.get("rsi")
 
     # 3. Schedule Window Verification
     current_hour = datetime.now(timezone.utc).hour
-    if start_hr <= end_hr:
-        in_window = start_hr <= current_hour <= end_hr
+    if schedule_configured:
+        if not (0 <= start_hr <= 23 and 0 <= end_hr <= 23):
+            return {"approved": False, "action": "hold", "reason": "invalid_schedule_config", "params": params}
+        if start_hr <= end_hr:
+            in_window = start_hr <= current_hour <= end_hr
+        else:
+            in_window = current_hour >= start_hr or current_hour <= end_hr
     else:
-        in_window = current_hour >= start_hr or current_hour <= end_hr
+        in_window = True
 
     if not in_window:
         return {"approved": False, "action": "hold", "reason": "outside_scheduled_hours", "params": params}
@@ -182,12 +191,11 @@ async def _fetch_recent_closed_trades(conn, asset: str, since: datetime, include
 async def _fetch_simulated_counts(conn, asset: str, since: datetime) -> Tuple[int, int, int]:
     query = """
         SELECT
-          SUM(CASE WHEN (COALESCE(would_have_won::int, 0) = 1) THEN 1 ELSE 0 END) AS wins,
-          SUM(CASE WHEN (COALESCE(would_have_lost::int, 0) = 1) THEN 1 ELSE 0 END) AS losses,
-          COUNT(*) AS total
-        FROM missed_trade_analytics
-        WHERE asset = $1
-          AND COALESCE(created_at, analyzed_at) >= $2
+          COUNT(*) FILTER (WHERE outcome = 'would_have_won') AS wins,
+          COUNT(*) FILTER (WHERE outcome = 'would_have_lost') AS losses,
+          COUNT(*) FILTER (WHERE evaluated = true) AS total
+        FROM missed_trade_signals
+        WHERE asset = $1 AND created_at >= $2
     """
     try:
         row = await conn.fetchrow(query, asset, since)
@@ -216,21 +224,20 @@ def _compute_stats_from_rows(rows) -> Tuple[float, float, int]:
 
 
 def _compute_stats_with_simulation(real_rows, sim_wins: int, sim_losses: int) -> Tuple[float, float, int]:
+    """Augment sample count/win rate, but compute profit factor from real cash P/L only.
+
+    Simulated missed-trade outcomes are categorical/count data. Adding them as 1.0
+    currency units to gross profit/loss would mix incomparable units and distort PF.
+    """
     real_win_losses = [r for r in real_rows if r["profit"] is not None]
-    real_wins = [r["profit"] for r in real_win_losses if r["profit"] > 0]
-    real_losses = [abs(r["profit"]) for r in real_win_losses if r["profit"] < 0]
-
-    total_wins = len(real_wins) + sim_wins
-    total_losses = len(real_losses) + sim_losses
-    total_sample = len(real_rows) + sim_wins + sim_losses
-
+    real_wins = sum(1 for r in real_win_losses if r["profit"] > 0)
+    real_losses = sum(1 for r in real_win_losses if r["profit"] < 0)
+    total_wins = real_wins + max(0, int(sim_wins))
+    total_losses = real_losses + max(0, int(sim_losses))
+    total_sample = len(real_rows) + max(0, int(sim_wins)) + max(0, int(sim_losses))
     win_rate = (total_wins / total_sample) * 100.0 if total_sample > 0 else 0.0
-
-    gross_profit_approx = float(sum(real_wins)) + float(sim_wins)
-    gross_loss_approx = float(sum(real_losses)) + float(sim_losses)
-
-    profit_factor = (gross_profit_approx / gross_loss_approx) if gross_loss_approx > 0 else (gross_profit_approx if gross_profit_approx > 0 else 0.0)
-    return round(win_rate, 1), round(profit_factor, 2), total_sample
+    _, real_profit_factor, _ = _compute_stats_from_rows(real_rows)
+    return round(win_rate, 1), real_profit_factor, total_sample
 
 
 async def _log_risk_incident_if_revoked(conn, asset, was_approved, now_approved, win_rate, profit_factor, sample_size):

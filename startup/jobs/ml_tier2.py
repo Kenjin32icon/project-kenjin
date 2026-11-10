@@ -219,25 +219,7 @@ def train_neural_maps(
 # ---------------------
 # Retrain Execution Cycle
 # ---------------------
-async def run_retrain_cycle(limit: int = 10000) -> bool:
-    """
-    Ingests missed-trade counterfactual labels with recency weighting,
-    pulls engineered feature windows, and retrains LightGBM models.
-    """
-    missed = await fetch_missed_trade_analytics_rows(limit=limit)
-    labels = compute_recency_weighted_labels(missed) if missed else []
-    log.info("ml_tier2: retrain cycle started. missed=%d labels=%d", len(missed), len(labels))
-
-    if not labels:
-        log.warning("ml_tier2: no counterfactual labels generated. Retrain cycle skipped.")
-        return False
-
-    df_augmented = pd.DataFrame(labels) if isinstance(labels, list) else labels
-    sample_weight = df_augmented.get('weight', None) if 'weight' in df_augmented.columns else None
-
-    success = train_neural_maps(df_augmented, sample_weight=sample_weight)
-    return success
-
+# Retraining is orchestrated by orchestrator.main.run_retrain_cycle.
 
 # ---------------------
 # OnlineTierUpdater

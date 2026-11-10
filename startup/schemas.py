@@ -1,10 +1,8 @@
 """
-Pydantic API contract schema for v11 orchestrator integration.
-These are the API contract between the MQL5 EA and this
-service - field names here must match exactly what the EA's PostTick(),
-PostTelemetry(), and FetchStrategyParams() send/expect.
+Pydantic API contract (v12) between the MQL5 EA and the orchestrator.
+Field names must match what the EA sends/expects exactly.
 """
-from typing import Optional
+from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -32,26 +30,25 @@ class TelemetryIn(BaseModel):
     lots: float
     profit: float
     rsi: Optional[float] = None
-    entry_score: Optional[float] = Field(default=None, alias="entry_score")
+    entry_score: Optional[float] = None
     sl_price: Optional[float] = None
     tp_price: Optional[float] = None
     magic_number: Optional[int] = None
-    account_type: Optional[str] = None  # 'demo' or 'live'
+    account_type: Optional[str] = None
     session_hour: Optional[int] = None
     forecast_id: Optional[int] = None
-    tier2_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)  # v11.1: sent by EA
+    tier2_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
-    class Config:
-        populate_by_name = True
+    model_config = {"populate_by_name": True}
 
 
 class StrategyParamsOut(BaseModel):
     asset: str
-    opt_threshold: float = Field(..., description="EV threshold required to trigger execution")
-    opt_sl_mult: float = Field(..., description="Dynamic Stop Loss multiplier based on rolling win rate")
-    opt_tp_mult: float = Field(..., description="Dynamic Take Profit multiplier based on rolling win rate")
-    rsi_buy_max: float = Field(70.0, description="Dynamic upper threshold for RSI buys")
-    rsi_sell_min: float = Field(30.0, description="Dynamic lower threshold for RSI sells")
+    opt_threshold: float
+    opt_sl_mult: float
+    opt_tp_mult: float
+    rsi_buy_max: float = 70.0
+    rsi_sell_min: float = 30.0
     live_approved: bool
     forecast_id: Optional[int] = None
     bullish_prob: Optional[float] = None
@@ -59,18 +56,22 @@ class StrategyParamsOut(BaseModel):
     tier2_action: str = "HOLD"
     tier2_confidence: float = Field(0.0, ge=0.0, le=1.0)
     recommended_lot_multiplier: float = 1.0
-    
-    micro_trend: str = Field("NEUTRAL", description="Short-horizon 1-2 min direction: BULLISH, BEARISH, NEUTRAL")
-    micro_trend_strength: float = Field(0.0, ge=0.0, le=1.0, description="Normalized velocity strength (0.0 to 1.0)")
-    
-    scheduled_start_hour: Optional[int] = Field(None, ge=0, le=23, description="UTC start hour for allowed executions")
-    scheduled_end_hour: Optional[int] = Field(None, ge=0, le=23, description="UTC end hour for allowed executions")
-    
-    calibration_score: Optional[float] = Field(None, description="Brier calibration score over rolling 30 days")
+    micro_trend: str = Field("NEUTRAL", description="BUY / SELL / NEUTRAL")
+    micro_trend_strength: float = Field(0.0, ge=0.0, le=1.0)
+    scheduled_start_hour: Optional[int] = Field(None, ge=0, le=23)
+    scheduled_end_hour: Optional[int] = Field(None, ge=0, le=23)
+    calibration_score: Optional[float] = None
     calibration_n: Optional[int] = None
-
-    # NEW v11.08: normalized-bps rolling stdev regime read
     volatility_regime: float = 0.0
+    lifeline_score: Optional[float] = None
+    lifeline_terminated: bool = False
+    # ---- v12 ----
+    trading_halted: bool = Field(False, description="Operator manual halt (dashboard) for this account type")
+    halt_reason: Optional[str] = None
+    market_bias: float = Field(0.0, ge=-1.0, le=1.0, description="Yahoo context bias, + favours long")
+    market_regime: str = "unknown"
+    market_fresh: bool = False
+    tier2_note: Optional[str] = None
 
 
 class HealthOut(BaseModel):
@@ -78,11 +79,12 @@ class HealthOut(BaseModel):
     db: str
     redis: str = "unknown"
     groq: str = "unknown"
+    yahoo: str = "unknown"
     mt5_last_seen_seconds: Optional[float] = None
 
 
 class AccountSnapshotIn(BaseModel):
-    account_type: str                                  # 'demo' or 'live'
+    account_type: str
     login: Optional[int] = None
     asset: Optional[str] = None
     balance: float
@@ -93,6 +95,7 @@ class AccountSnapshotIn(BaseModel):
     peak_equity: Optional[float] = None
     drawdown_pct: Optional[float] = None
     day_loss_pct: Optional[float] = None
+    day_start_balance: Optional[float] = None   # v12: EA now sends dayStartEquity
     consecutive_losses: Optional[int] = None
     consecutive_wins: Optional[int] = None
     risk_cooldown_active: Optional[bool] = None
@@ -107,35 +110,61 @@ class RiskIncidentIn(BaseModel):
 
 
 class MissedTradeIn(BaseModel):
-    """
-    Contract for POST /missed_trade. Sent by the EA's PostMissedTrade()
-    whenever a would-have-traded signal (raw technical score crossed the
-    effective threshold, or Tier-2 issued a non-HOLD directive) was NOT
-    executed because a risk gate, veto, or precondition blocked it.
-
-    This is deliberately separate from missed_trade_analytics (which is
-    populated by the offline Groq backtest pipeline in
-    startup/jobs/auto_tester.py) - this table captures REAL live/demo
-    missed opportunities, one row per blocked decision, so
-    startup/jobs/missed_trade_evaluator.py can later walk tick_telemetry
-    forward and label whether the missed trade would have won or lost.
-    """
     asset: str
-    account_type: Optional[str] = None            # 'demo' or 'live'
-    reason: str                                    # e.g. rsi_veto, lifeline_terminated, daily_loss_limit,
-                                                     # max_consecutive_losses, orchestrator_unhealthy,
-                                                     # live_approval_required, drawdown_halt, margin_buffer,
-                                                     # micro_risk_oversized, tier2_local_score_mismatch
-    side: str                                       # 'BUY' or 'SELL'
-    score: Optional[float] = None                   # final (post-veto) score at decision time
-    raw_score: Optional[float] = None               # pre-veto/raw technical score
-    threshold: Optional[float] = None               # effective entry threshold at decision time
+    account_type: Optional[str] = None
+    reason: str
+    side: str
+    score: Optional[float] = None
+    raw_score: Optional[float] = None
+    threshold: Optional[float] = None
     rsi: Optional[float] = None
-    price: Optional[float] = None                   # bid/ask (side-appropriate) at time of the blocked signal
+    price: Optional[float] = None
     atr: Optional[float] = None
-    sl_distance: Optional[float] = None             # ATR * sl_mult the trade would have used
-    tp_distance: Optional[float] = None             # ATR * tp_mult the trade would have used
+    sl_distance: Optional[float] = None
+    tp_distance: Optional[float] = None
     tier2_action: Optional[str] = None
     tier2_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     session_hour: Optional[int] = None
     magic_number: Optional[int] = None
+
+
+class PositionReportIn(BaseModel):
+    """POST /guardian/evaluate - sent by the EA every few seconds per open position."""
+    asset: str
+    ticket: int
+    side: str                                   # BUY / SELL
+    account_type: Optional[str] = None
+    open_price: float
+    price: float
+    sl: float = 0.0
+    tp: float = 0.0
+    lots: float = 0.0
+    profit: float = 0.0
+    r_multiple: float                           # profit in units of the INITIAL stop distance
+    peak_r: float = 0.0
+    initial_sl_distance: float = 0.0
+    open_seconds: float = 0.0
+    max_hold_seconds: float = 3600.0
+    momentum_against: bool = False
+    rsi: Optional[float] = None
+
+
+class GuardianDecisionOut(BaseModel):
+    action: str = "HOLD"                        # HOLD | CLOSE | MOVE_SL
+    reason: str = "ok"
+    new_sl: float = 0.0
+    r_multiple: float = 0.0
+    against_votes: int = 0
+    votes: List[str] = []
+    market_bias: float = 0.0
+    slope_r_min: Optional[float] = None
+    peak_r: float = 0.0
+
+
+class MarketContextOut(BaseModel):
+    fresh: bool
+    regime: str
+    summary: str = ""
+    macro: Dict[str, dict] = {}
+    assets: Dict[str, dict] = {}
+    ts: float = 0.0

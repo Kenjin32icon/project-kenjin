@@ -16,27 +16,25 @@ log = logging.getLogger("auto_tester")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
 
 
-def _build_mt5_terminal_path() -> str:
-    explicit = os.environ.get("MT5_PATH", "").strip()
-    if explicit:
-        return explicit
+def _mt5_config():
+    """Return explicit executable, Wine environment and terminal arguments.
 
-    # Portable fallbacks: derive the Wine-side username from the actual
-    # logged-in Linux user (Wine mirrors it into drive_c/users/<name> by
-    # default), default WINE_BIN to the binary the standard `apt install
-    # wine` package actually provides, and default WINEPREFIX under the
-    # current user's $HOME rather than a hardcoded stranger's home dir.
-    linux_user = os.environ.get("USER") or os.environ.get("LOGNAME") or "Public"
-    wineprefix = os.environ.get("WINEPREFIX_DEMO", os.path.expanduser("~/.wine-kenjin-demo"))
+    MT5_TERMINAL_EXE is a Windows executable path visible inside the configured
+    Wine prefix (normally terminal64.exe), not a shell command string.
+    """
+    import shlex
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
     wine_bin = os.environ.get("WINE_BIN", "wine")
-    shortcut = os.environ.get(
-        "MT5_SHORTCUT_PATH_DEMO",
-        rf"C:\users\{linux_user}\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\FBS MetaTrader 5\FBS MT5.lnk",
-    )
-    return f'env WINEPREFIX="{wineprefix}" {wine_bin} "{shortcut}"'
+    wineprefix = os.environ.get("WINEPREFIX_DEMO") or os.environ.get("WINEPREFIX") or os.path.expanduser("~/.wine-kenjin")
+    terminal = os.environ.get("MT5_TERMINAL_EXE", r"C:\Program Files\FBS MetaTrader 5\terminal64.exe").strip()
+    expert = os.environ.get("MT5_TESTER_EXPERT", "MAPSAR_ProfitEngine_v12_00.ex5").strip()
+    reports = os.environ.get("MT5_REPORT_DIR", str(root / "reports"))
+    return wine_bin, wineprefix, terminal, expert, reports
 
 
-MT5_TERMINAL_PATH = _build_mt5_terminal_path()
+WINE_BIN, WINEPREFIX_DEMO, MT5_TERMINAL_EXE, MT5_TESTER_EXPERT, MT5_REPORT_DIR = _mt5_config()
 
 
 def archive_and_parse_report(wine_report_path: str, asset: str, local_reports_dir: str = "./reports") -> dict:
@@ -110,38 +108,59 @@ def archive_and_parse_report(wine_report_path: str, asset: str, local_reports_di
 
 
 async def run_headless_optimization(asset: str) -> str:
-    """Generates an INI file and runs MT5 headlessly via Wine using a non-blocking async process."""
-    ini_content = f"""[Tester]
-Expert=v10_kenjin.ex5
-Symbol={asset}
-Period=M5
-Optimization=1
-Model=2
-Report={asset}_report.xml
-ReplaceReport=1
-ShutdownTerminal=1
-"""
-    ini_path = f"/tmp/{asset}_tester.ini"
-    with open(ini_path, "w") as f:
-        f.write(ini_content)
+    """Run MT5 Strategy Tester with a dedicated .set that disables WebRequest.
 
-    log.info(f"Starting headless optimization for {asset}...")
-    
-    # Non-blocking async process creation
-    proc = await asyncio.create_subprocess_shell(
-        f"{MT5_TERMINAL_PATH} /config:{ini_path}",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+    Install the compiled v12 EA in the MT5 data directory before enabling this job.
+    """
+    from pathlib import Path
+    import tempfile
+
+    root = Path(__file__).resolve().parents[2]
+    reports_dir = Path(MT5_REPORT_DIR)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_name = f"{asset}_report.xml"
+    ini_path = Path(tempfile.gettempdir()) / f"kenjin_{asset}_tester.ini"
+    set_path = Path(tempfile.gettempdir()) / f"kenjin_{asset}_tester.set"
+
+    # MT5 .set format: value||value||min||max||step||Y/N.
+    set_path.write_text("InpUseOrchestrator=false||false||0||true||N\nInpPostTicks=false||false||0||true||N\nInpUseGuardian=false||false||0||true||N\n", encoding="utf-8")
+    ini_path.write_text(
+        "[Tester]\n"
+        f"Expert={MT5_TESTER_EXPERT}\n"
+        f"ExpertParameters={set_path}\n"
+        f"Symbol={asset}\n"
+        "Period=M5\nOptimization=1\nModel=2\n"
+        f"Report={reports_dir / report_name}\n"
+        "ReplaceReport=1\nShutdownTerminal=1\n",
+        encoding="utf-8",
     )
-    await proc.communicate()
-    
-    # Check temporary path first, then Wine prefix path
-    report_path = f"/tmp/{asset}_report.xml"
-    if not os.path.exists(report_path):
-        linux_user = os.environ.get("USER") or os.environ.get("LOGNAME") or "Public"
-        wineprefix = os.environ.get("WINEPREFIX_DEMO", os.path.expanduser("~/.wine-kenjin-demo"))
-        report_path = os.path.join(wineprefix, f"drive_c/Program Files/MetaTrader 5/Tester/{asset}_report.xml")
-    return report_path
+
+    env = os.environ.copy()
+    env["WINEPREFIX"] = WINEPREFIX_DEMO
+    cmd = [WINE_BIN, MT5_TERMINAL_EXE, f"/config:{ini_path}"]
+    log.info("Starting MT5 optimization for %s: %s", asset, " ".join(cmd))
+    timeout = int(os.environ.get("AUTO_TESTER_TIMEOUT_SECONDS", "14400"))
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise TimeoutError(f"MT5 Strategy Tester exceeded {timeout}s for {asset}")
+    if proc.returncode != 0:
+        log.error("MT5 tester exited %s for %s; stderr=%s", proc.returncode, asset, stderr.decode(errors="replace")[-2000:])
+
+    expected = reports_dir / report_name
+    if expected.exists():
+        return str(expected)
+    # MT5 sometimes writes the report under the active terminal data folder.
+    candidates = [Path("/tmp") / report_name, Path(WINEPREFIX_DEMO) / "drive_c/Program Files/FBS MetaTrader 5/Tester" / report_name]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(expected)
 
 
 async def analyze_missed_trades_with_groq(asset: str, optimization_data: dict) -> None:
@@ -202,7 +221,7 @@ async def analyze_missed_trades_with_groq(asset: str, optimization_data: dict) -
 
 async def continuous_tester_cycle() -> None:
     """Main job loop to be added to APScheduler."""
-    assets_to_test = ["BTCUSD", "EURUSD"]
+    assets_to_test = [s.strip().upper() for s in os.environ.get("AUTO_TESTER_ASSETS", "BTCUSD,EURUSD").split(",") if s.strip()]
 
     for asset in assets_to_test:
         try:
@@ -212,7 +231,7 @@ async def continuous_tester_cycle() -> None:
                 log.error(f"Report not found for {asset} at {report_path}")
                 continue
 
-            local_reports_dir = os.path.expanduser("~/project-kenjin/reports")
+            local_reports_dir = MT5_REPORT_DIR
             real_parsed_data = archive_and_parse_report(
                 wine_report_path=report_path,
                 asset=asset,

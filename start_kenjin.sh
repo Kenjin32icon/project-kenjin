@@ -71,15 +71,12 @@ fi
 # -----------------------------------------------------------------------------
 echo "==> Terminating any previously running instances of Kenjin Orchestrator, MT5, and Electron..."
 
+# Only stop the orchestrator process we launched by command signature. Do not
+# indiscriminately kill whichever application happens to own KENJIN_PORT.
 pkill -f "uvicorn orchestrator.main:app" 2>/dev/null || true
-if command -v fuser >/dev/null 2>&1; then
-    fuser -k "${KENJIN_PORT}/tcp" 2>/dev/null || true
-fi
-
 pkill -f "terminal64.exe" 2>/dev/null || true
 pkill -f "FBS MT5" 2>/dev/null || true
-pkill -f "wine-stable" 2>/dev/null || true
-pkill -f "electron" 2>/dev/null || true
+pkill -f "electron-app/node_modules/.bin/electron" 2>/dev/null || true
 
 sleep 2
 echo "==> Cleanup complete."
@@ -94,11 +91,11 @@ elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet redis-s
 elif command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q redis-server; then
     echo "==> Starting Redis via systemd..."
     sudo systemctl start redis-server
-elif command -v redis-server >/dev/null 2>&1; then
-    echo "==> Starting Redis as background daemon..."
+elif command -v redis-server >/dev/null 2>&1 && [[ "${REDIS_URL:-redis://localhost:6379/0}" == redis://localhost* || "${REDIS_URL:-redis://localhost:6379/0}" == redis://127.0.0.1* ]]; then
+    echo "==> Starting local Redis as background daemon..."
     redis-server --daemonize yes
 else
-    echo "WARNING: redis-server not found. Orchestrator will default to Postgres fallback."
+    echo "WARNING: Redis not reachable; cache-dependent features will degrade. Install/start Redis or correct REDIS_URL."
 fi
 
 # -----------------------------------------------------------------------------
@@ -163,6 +160,7 @@ else
     # creation time) and fast (skips the pip resolve entirely when nothing
     # changed, instead of paying that cost on every single launch).
     REQ_FILE="orchestrator/requirements.txt"
+    if [ ! -f "$REQ_FILE" ]; then echo "ERROR: missing $REQ_FILE"; exit 1; fi
     REQ_HASH_FILE="$VENV_PATH/.requirements.sha256"
     NEW_REQ_HASH="$(sha256sum "$REQ_FILE" 2>/dev/null | awk '{print $1}')"
     OLD_REQ_HASH="$(cat "$REQ_HASH_FILE" 2>/dev/null || echo "")"
@@ -187,7 +185,7 @@ if [ -z "${DATABASE_URL:-}" ]; then
     exit 1
 fi
 echo "==> Checking DATABASE_URL is reachable..."
-python3 - <<'PYEOF'
+python - <<'PYEOF'
 import os, sys
 import asyncio
 import asyncpg

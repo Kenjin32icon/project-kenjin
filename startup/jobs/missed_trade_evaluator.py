@@ -13,9 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from startup.db import (
-    fetch_missed_trade_analytics_rows,
     get_pool,
-    insert_missed_trade_signal,
 )
 
 log = logging.getLogger("missed_trade_evaluator")
@@ -36,32 +34,6 @@ RSI_SELL_MIN_BOUNDS = (15.0, 40.0)
 # -----------------------
 # ML Training & Dataset Export Helper
 # -----------------------
-def evaluate_and_label_missed_trades(limit: int = 1000) -> List[Dict[str, Any]]:
-    """
-    Exports labeled missed-trade counterfactuals for ML training and offline analytics.
-    Ensures asset column normalization and persists signals via insert_missed_trade_signal.
-    """
-    rows: List[Dict[str, Any]] = []
-    try:
-        analytics_rows = fetch_missed_trade_analytics_rows(limit=limit)
-        if analytics_rows:
-            rows = [dict(r) if hasattr(r, "_asdict") or isinstance(r, dict) else dict(r) for r in analytics_rows]
-    except Exception as exc:
-        log.warning("Could not fetch existing analytics rows, falling back to empty list: %s", exc)
-        rows = []
-
-    for r in rows:
-        # ensure asset column exists
-        r["asset"] = r.get("asset") or r.get("symbol")
-        try:
-            insert_missed_trade_signal(r)
-        except Exception as exc:
-            log.exception("Error inserting missed trade signal for asset %s: %s", r.get("asset"), exc)
-
-    log.info("Labeled %d missed trades", len(rows))
-    return rows
-
-
 # -----------------------
 # Counterfactual Evaluation Engine
 # -----------------------

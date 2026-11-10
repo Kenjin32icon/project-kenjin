@@ -34,15 +34,11 @@ set VENV_PATH=orchestrator\.venv
 if not exist "%VENV_PATH%" (
     echo ==^> Creating Python virtual environment...
     python -m venv "%VENV_PATH%"
-    echo ==^> Installing Python dependencies...
-    call "%VENV_PATH%\Scripts\activate.bat"
-    python -m pip install --upgrade pip
-    if exist "orchestrator\requirements.txt" (
-        pip install -r orchestrator\requirements.txt
-    )
-) else (
-    call "%VENV_PATH%\Scripts\activate.bat"
 )
+call "%VENV_PATH%\Scripts\activate.bat"
+echo ==^> Checking Python dependencies...
+python -m pip install --upgrade pip
+python -m pip install -r orchestrator\requirements.txt
 
 :: 5. Install Electron Dependencies
 echo ==^> Checking UI dependencies...
@@ -59,7 +55,7 @@ echo ==^> Launching FBS MetaTrader 5...
 start "" "C:\Program Files\FBS MetaTrader 5\terminal64.exe"
 
 echo ==^> Starting Kenjin Orchestrator API...
-start "Kenjin Orchestrator (FastAPI)" cmd /c "call %VENV_PATH%\Scripts\activate.bat && uvicorn orchestrator.main:app --host 127.0.0.1 --port 8000 --env-file .env"
+start "Kenjin Orchestrator (FastAPI)" cmd /c "call %VENV_PATH%\Scripts\activate.bat && python -m uvicorn orchestrator.main:app --host 127.0.0.1 --port 8000 --env-file .env"
 
 :: Wait a few seconds for the API to boot
 timeout /t 5 /nobreak >nul
