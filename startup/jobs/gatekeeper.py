@@ -23,6 +23,7 @@ import asyncpg
 from startup.db import (
     fetch_missed_trade_analytics_rows,
     fetch_strategy_params,
+    get_account_control,
     get_pool,
 )
 
@@ -81,6 +82,21 @@ async def evaluate_gatekeeper_signal(
     Daily Loss Limit, Asset Live Approval, Hourly Schedule, RSI Veto, and Score Threshold.
     """
     pool = get_pool()
+
+    # 0. Manual Drawdown Halt (operator override, dashboard Start/Stop button)
+    # This is intentionally checked before every other gate, including the
+    # automatic daily loss cap below: an operator-initiated halt must win
+    # even if account metrics look fine, and must NOT require the EA's own
+    # local drawdown_halt flag to agree (that flag is EA-local and can lag
+    # or disagree with what the operator sees on the dashboard).
+    control = await get_account_control(account_type)
+    if control.get("manual_drawdown_halt"):
+        return {
+            "approved": False,
+            "action": "veto",
+            "reason": "manual_drawdown_halt",
+            "details": control.get("halt_reason") or "Operator halted automated trading via dashboard.",
+        }
 
     # 1. Daily Loss Cap Check
     if current_balance > 0 and current_equity > 0:

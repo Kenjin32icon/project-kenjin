@@ -23,6 +23,8 @@
     --accent: #3b82f6;
     --accent-hover: #2563eb;
     --accent-bg: rgba(59, 130, 246, 0.15);
+    --purple: #a78bfa;
+    --purple-bg: rgba(167, 139, 250, 0.15);
     --radius-lg: 12px;
     --radius-md: 8px;
     --radius-sm: 6px;
@@ -177,6 +179,26 @@
   }
   .btn-danger:hover { background: var(--red); color: white; border-color: var(--red); }
 
+  .btn-halt {
+    background: var(--red-bg);
+    color: var(--red);
+    border: 1px solid rgba(244, 63, 94, 0.3);
+    width: 100%;
+    margin-top: 10px;
+  }
+  .btn-halt:hover { background: var(--red); color: white; }
+
+  .btn-resume {
+    background: var(--green-bg);
+    color: var(--green);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+    width: 100%;
+    margin-top: 10px;
+  }
+  .btn-resume:hover { background: var(--green); color: white; }
+
+  .btn[disabled] { opacity: 0.5; cursor: not-allowed; transform: none !important; }
+
   .status-text { margin-left: auto; color: var(--muted); font-size: 12px; font-family: 'JetBrains Mono', monospace; }
   .status-text.err { color: var(--red); font-weight: 600; }
 
@@ -197,6 +219,8 @@
     justify-content: space-between;
     align-items: center;
     margin-bottom: 16px;
+    gap: 12px;
+    flex-wrap: wrap;
   }
 
   .panel h2 {
@@ -205,6 +229,29 @@
     color: var(--text);
     font-weight: 600;
     letter-spacing: 0.5px;
+  }
+
+  .panel-sub {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 4px;
+    font-weight: 400;
+  }
+
+  .panel-header-controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  select.mini-select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 10px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    font-family: 'JetBrains Mono', monospace;
   }
 
   .grid-summary {
@@ -223,6 +270,8 @@
   }
   
   .card:hover { background: rgba(39, 39, 42, 0.4); transform: translateY(-2px); }
+
+  .card.halted { border-color: rgba(244, 63, 94, 0.5); }
 
   .card .label {
     font-size: 11px;
@@ -246,6 +295,8 @@
   tr:last-child td { border-bottom: none; }
   tbody tr { transition: background 0.15s; }
   tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
+  tbody tr.candidate-row { background: rgba(167, 139, 250, 0.06); }
+  tbody tr.candidate-row:hover { background: rgba(167, 139, 250, 0.12); }
 
   .badge {
     display: inline-flex;
@@ -263,6 +314,8 @@
   .badge.bullish { background: var(--green-bg); color: var(--green); }
   .badge.bearish { background: var(--red-bg); color: var(--red); }
   .badge.neutral { background: rgba(161, 161, 170, 0.15); color: var(--muted); }
+  .badge.candidate { background: var(--purple-bg); color: var(--purple); border: 1px solid rgba(167, 139, 250, 0.35); }
+  .badge.manual-halt { background: var(--red-bg); color: var(--red); border: 1px solid rgba(244, 63, 94, 0.3); }
 
   .profit-pos { color: var(--green); font-weight: 600; }
   .profit-neg { color: var(--red); font-weight: 600; }
@@ -321,7 +374,17 @@
     gap: 24px;
     margin-bottom: 24px;
   }
-  
+
+  .missed-summary-strip {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+
+  .missed-summary-strip .card { padding: 12px 16px; }
+  .missed-summary-strip .value { font-size: 18px; }
+
   @media (max-width: 1024px) {
     .dashboard-columns { grid-template-columns: 1fr; gap: 16px; }
     body { padding: 16px; }
@@ -391,6 +454,13 @@
   </div>
 </div>
 
+<!-- ==========================================================================
+     Live Account State: each card now carries a manual drawdown-halt
+     Start/Stop button (POST /control/drawdown_halt), separate from the
+     read-only "DRAWDOWN HALT" badge that reflects the EA's own local
+     circuit breaker. Halting here is enforced by Gatekeeper server-side -
+     it isn't just a dashboard label.
+     ========================================================================== -->
 <div class="dashboard-columns">
   <div class="panel" style="margin-bottom:0">
     <div class="panel-header"><h2>Live Account State</h2></div>
@@ -413,6 +483,45 @@
         <th>EV Thresh</th><th>SL / TP Mult</th><th>Trading Hours</th><th>Micro Trend</th><th>Calibration</th><th>Actions</th>
       </tr></thead>
       <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ==========================================================================
+     NEW MODULE: Missed-Trade Analytics
+     Source: GET /missed_trades/summary?days=N (startup/jobs/missed_trade_evaluator.py)
+     Every row here is a signal the automated system VETOED (RSI exhaustion,
+     score below threshold, outside trading hours, etc.) that has since been
+     counterfactually simulated forward against real tick data. Rows flagged
+     "MANUAL CANDIDATE" are assets/reasons where the veto would mostly have
+     been wrong (>=55% would-have-won) - i.e. good candidates for a human to
+     trade by hand while the underlying veto threshold gets tuned.
+     ========================================================================== -->
+<div class="panel">
+  <div class="panel-header">
+    <div>
+      <h2>Missed-Trade Analytics — Manual Trade Candidates</h2>
+      <div class="panel-sub">Counterfactual outcomes for signals the algo vetoed. Purple rows are veto/asset pairs worth trading manually.</div>
+    </div>
+    <div class="panel-header-controls">
+      <select class="mini-select" id="missedTradeWindow" onchange="fetchMissedTrades()">
+        <option value="1">Last 24h</option>
+        <option value="3">Last 3 days</option>
+        <option value="7" selected>Last 7 days</option>
+        <option value="14">Last 14 days</option>
+        <option value="30">Last 30 days</option>
+      </select>
+      <button class="btn btn-outline" style="padding:6px 12px; font-size:12px;" onclick="fetchMissedTrades()">Refresh</button>
+    </div>
+  </div>
+  <div class="missed-summary-strip" id="missedTradeSummaryStrip"></div>
+  <div style="overflow-x: auto;">
+    <table id="missedTradeTable">
+      <thead><tr>
+        <th>Asset</th><th>Veto Reason</th><th>Blocked</th><th>Evaluated</th>
+        <th>Would Have Won</th><th>Missed Win Rate</th><th>Avg Simulated R</th><th></th>
+      </tr></thead>
+      <tbody><tr><td colspan="8" class="sub-value">Connect to load missed-trade analytics…</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -450,6 +559,11 @@ let socket = null;
 let chart = null;
 let wsReconnectAttempts = 0;   // v11.07: back off instead of a fixed 3s retry forever
 let lastCloseWasAuthFailure = false;
+
+// Threshold used purely for the frontend's "MANUAL CANDIDATE" flag. Must
+// stay evaluated_count-aware server-side too; this just decides styling.
+const MISSED_TRADE_CANDIDATE_WIN_RATE = 55.0;
+const MISSED_TRADE_MIN_EVALUATED = 5;
 
 function escapeHTML(s) {
     if (s === null || s === undefined) return '';
@@ -570,6 +684,15 @@ function connectWebSocket() {
             logConsole(`[TRADE CLOSED] P/L Settled: ${payload.profit}`, "info");
             fetchKpis();
         }
+
+        // NEW: pushed by POST /control/drawdown_halt so every connected
+        // dashboard (not just the one that clicked the button) reflects the
+        // new halt state immediately, without waiting for the next poll.
+        if (payload.type === "ACCOUNT_CONTROL_UPDATE") {
+            const label = payload.manual_drawdown_halt ? 'HALTED' : 'RESUMED';
+            logConsole(`[ACCOUNT CONTROL] ${(payload.account_type || '').toUpperCase()} automated trading ${label}${payload.reason ? ' — ' + payload.reason : ''}`, payload.manual_drawdown_halt ? "err" : "info");
+            fetchKpis();
+        }
     };
 
     // v11.07 FIX: the backend (main.py::websocket_dashboard_endpoint) closes
@@ -616,6 +739,7 @@ function saveAndLoad() {
 
     fetchKpis();
     fetchHealth();
+    fetchMissedTrades();
     connectWebSocket();
 }
 
@@ -733,23 +857,37 @@ function render(data) {
         });
     } catch (e) { logConsole(`Render error (equity chart): ${e.message}`, 'err'); }
 
+    // ------------------------------------------------------------------
+    // Live Account State cards - now with a manual drawdown-halt
+    // Start/Stop button in addition to the existing read-only badges.
+    // `a.drawdown_halt`         -> EA-local circuit breaker (read-only, informational)
+    // `a.manual_drawdown_halt`  -> orchestrator override (this is what the button controls)
+    // ------------------------------------------------------------------
     try {
         const acctEl = document.getElementById('accountCards');
         if (data.accounts && data.accounts.length) {
             acctEl.innerHTML = data.accounts.map(a => {
                 const stale = a.seconds_since_update > 120;
                 const safeAsset = escapeHTML(a.asset ?? 'n/a');
-                const safeAcctType = escapeHTML((a.account_type ?? 'unknown').toUpperCase());
+                const acctType = a.account_type ?? 'unknown';
+                const safeAcctType = escapeHTML(acctType.toUpperCase());
                 const staleTag = stale ? `<div class="sub-value" style="color: var(--red);">STALE — no update in ${Math.round(a.seconds_since_update)}s</div>` : '';
-                const haltTag = a.drawdown_halt ? '<span class="badge bearish">DRAWDOWN HALT</span>' : (a.risk_cooldown_active ? '<span class="badge neutral">COOLDOWN</span>' : '<span class="badge live">NORMAL</span>');
+                const haltTag = a.drawdown_halt ? '<span class="badge bearish">EA DRAWDOWN HALT</span>' : (a.risk_cooldown_active ? '<span class="badge neutral">COOLDOWN</span>' : '<span class="badge live">NORMAL</span>');
+                const manualHalted = !!a.manual_drawdown_halt;
+                const manualTag = manualHalted ? `<span class="badge manual-halt">MANUAL HALT ACTIVE</span>` : '';
+                const manualReason = manualHalted && a.manual_halt_reason ? `<div class="sub-value">${escapeHTML(a.manual_halt_reason)}</div>` : '';
+                const btnLabel = manualHalted ? 'Resume Automated Trading' : 'Start Drawdown Halt';
+                const btnClass = manualHalted ? 'btn-resume' : 'btn-halt';
                 return `
-                    <div class="card">
+                    <div class="card ${manualHalted ? 'halted' : ''}">
                         <div class="label">${safeAcctType} — ${safeAsset}</div>
                         <div class="value ${a.equity >= a.balance ? 'pos' : 'neg'}">${a.equity != null ? a.equity.toFixed(2) : '—'}</div>
                         <div class="sub-value">Balance ${a.balance != null ? a.balance.toFixed(2) : '—'} · Floating ${a.floating_pl != null ? (a.floating_pl >= 0 ? '+' : '') + a.floating_pl.toFixed(2) : '—'}</div>
                         <div class="sub-value">Drawdown ${a.drawdown_pct != null ? a.drawdown_pct.toFixed(1) : '0.0'}% · Daily loss ${a.day_loss_pct != null ? a.day_loss_pct.toFixed(1) : '0.0'}%</div>
-                        <div class="sub-value" style="margin-top: 10px;">${haltTag}</div>
+                        <div class="sub-value" style="margin-top: 10px; display:flex; gap:6px; flex-wrap:wrap;">${haltTag}${manualTag}</div>
+                        ${manualReason}
                         ${staleTag}
+                        <button class="btn ${btnClass}" onclick="toggleDrawdownHalt('${acctType}', ${!manualHalted})">${btnLabel}</button>
                     </div>`;
             }).join('');
         } else {
@@ -825,6 +963,77 @@ function render(data) {
             </tr>`;
         }).join('');
     } catch (e) { logConsole(`Render error (recent trades): ${e.message}`, 'err'); }
+}
+
+// ============================================================================
+// NEW MODULE: Missed-Trade Analytics
+// Pulls GET /missed_trades/summary?days=N and renders both a top-line
+// summary strip and a per-asset/reason breakdown table. Rows with enough
+// evaluated samples AND a high missed-win-rate are flagged as manual trade
+// candidates - assets the operator may want to trade by hand while the
+// underlying veto (RSI threshold, score threshold, etc.) gets tuned.
+// ============================================================================
+async function fetchMissedTrades() {
+    const baseUrl = getCleanBaseUrl();
+    const apiKey = document.getElementById('apiKey').value.trim();
+    const days = document.getElementById('missedTradeWindow').value;
+    if (!apiKey) return; // fetchKpis() already surfaces the "API key missing" state
+
+    try {
+        const response = await fetch(`${baseUrl}/missed_trades/summary?days=${encodeURIComponent(days)}`, {
+            method: "GET",
+            headers: { "X-API-Key": apiKey, "Content-Type": "application/json" }
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        renderMissedTrades(data);
+    } catch (error) {
+        logConsole(`Missed-trade analytics fetch failed: ${error.message}`, 'err');
+        const tbody = document.querySelector('#missedTradeTable tbody');
+        if (tbody) tbody.innerHTML = `<tr><td colspan="8" class="sub-value">Failed to load: ${escapeHTML(error.message)}</td></tr>`;
+    }
+}
+
+function renderMissedTrades(data) {
+    try {
+        const s = data.summary || {};
+        const strip = document.getElementById('missedTradeSummaryStrip');
+        strip.innerHTML = `
+            <div class="card"><div class="label">Blocked Signals (${data.window_days ?? '—'}d)</div><div class="value">${Number(s.total_blocked_signals ?? 0)}</div></div>
+            <div class="card"><div class="label">Evaluated</div><div class="value">${Number(s.total_evaluated ?? 0)}</div></div>
+            <div class="card"><div class="label">Would Have Won</div><div class="value pos">${Number(s.total_would_have_won ?? 0)}</div></div>
+            <div class="card"><div class="label">Overall Missed Win Rate</div><div class="value ${(s.overall_missed_win_rate_pct ?? 0) >= MISSED_TRADE_CANDIDATE_WIN_RATE ? 'pos' : ''}">${s.overall_missed_win_rate_pct != null ? s.overall_missed_win_rate_pct + '%' : '—'}</div></div>
+        `;
+    } catch (e) { logConsole(`Render error (missed-trade summary): ${e.message}`, 'err'); }
+
+    try {
+        const tbody = document.querySelector('#missedTradeTable tbody');
+        const rows = data.by_asset_and_reason || [];
+        if (!rows.length) {
+            tbody.innerHTML = `<tr><td colspan="8" class="sub-value">No missed-trade signals recorded for this window.</td></tr>`;
+            return;
+        }
+        tbody.innerHTML = rows.map(r => {
+            const safeAsset = escapeHTML(r.asset ?? '—');
+            const safeReason = escapeHTML(r.reason ?? '—');
+            const winRate = r.missed_win_rate_pct;
+            const isCandidate = winRate !== null && winRate !== undefined
+                && winRate >= MISSED_TRADE_CANDIDATE_WIN_RATE
+                && (r.evaluated_count ?? 0) >= MISSED_TRADE_MIN_EVALUATED;
+            const avgR = r.avg_simulated_r;
+            return `
+            <tr class="${isCandidate ? 'candidate-row' : ''}">
+                <td><b>${safeAsset}</b></td>
+                <td>${safeReason}</td>
+                <td>${Number(r.blocked_count ?? 0)}</td>
+                <td>${Number(r.evaluated_count ?? 0)}</td>
+                <td class="profit-pos">${Number(r.would_have_won ?? 0)}</td>
+                <td class="${winRate != null && winRate >= 50 ? 'profit-pos' : winRate != null ? 'profit-neg' : ''}">${winRate != null ? winRate + '%' : '—'}</td>
+                <td class="${avgR != null && avgR >= 0 ? 'profit-pos' : avgR != null ? 'profit-neg' : ''}">${avgR != null ? (avgR >= 0 ? '+' : '') + avgR : '—'}</td>
+                <td>${isCandidate ? '<span class="badge candidate">Manual Candidate</span>' : ''}</td>
+            </tr>`;
+        }).join('');
+    } catch (e) { logConsole(`Render error (missed-trade table): ${e.message}`, 'err'); }
 }
 
 async function triggerKillSwitch() {
@@ -905,8 +1114,44 @@ async function toggleAssetLive(asset, newState) {
     }
 }
 
-// Periodic refresh - unchanged behavior, just kept explicit here.
-setInterval(() => { fetchKpis(); fetchHealth(); }, 15000);
+// ============================================================================
+// NEW: Start/Stop manual drawdown halt for one account_type ('live'/'demo').
+// halt=true  -> POST /control/drawdown_halt {halt:true}  -> Gatekeeper vetoes
+//               every new signal for that account_type until this is cleared.
+// halt=false -> resumes automated algo-trading for that account_type,
+//               subject to every other existing gate.
+// ============================================================================
+async function toggleDrawdownHalt(accountType, haltState) {
+    const confirmMsg = haltState
+        ? `Halt ALL automated algo-trading for ${accountType.toUpperCase()} accounts? Existing gates (kill switch, daily loss cap, etc.) still apply on top of this.`
+        : `Resume automated algo-trading for ${accountType.toUpperCase()} accounts?`;
+    if (!confirm(confirmMsg)) return;
+
+    const baseUrl = getCleanBaseUrl();
+    const apiKey = document.getElementById("apiKey").value.trim();
+    const reason = haltState
+        ? (prompt('Optional reason for this halt (shown in Risk Incidents):', 'Manual operator drawdown halt') || 'Manual operator drawdown halt')
+        : 'Manual operator resume from admin dashboard';
+
+    logConsole(`${haltState ? 'Halting' : 'Resuming'} automated trading for ${accountType}...`, haltState ? 'err' : 'warn');
+
+    try {
+        const response = await fetch(`${baseUrl}/control/drawdown_halt`, {
+            method: "POST",
+            headers: { "X-API-Key": apiKey, "Content-Type": "application/json" },
+            body: JSON.stringify({ account_type: accountType, halt: haltState, reason })
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        const data = await response.json();
+        logConsole(data.message || `Drawdown halt for ${accountType} set to ${haltState}.`, haltState ? 'err' : 'info');
+        fetchKpis();
+    } catch (error) {
+        logConsole(`Drawdown halt toggle failed for ${accountType}: ${error.message}`, "err");
+    }
+}
+
+// Periodic refresh - unchanged behavior, plus the new missed-trade panel.
+setInterval(() => { fetchKpis(); fetchHealth(); fetchMissedTrades(); }, 15000);
 </script>
 </body>
 </html>

@@ -3,11 +3,12 @@
 Async Postgres connection pool & database access helpers.
 
 Provides central asyncpg connection management and helper functions for jobs
-including gatekeeper autotuning, lifeline engine, and trade analytics telemetry.
+including gatekeeper autotuning, lifeline engine, trade analytics telemetry,
+and account drawdown overrides.
 """
 
-import os
 import logging
+import os
 from typing import Any, Dict, List, Optional, Union
 import asyncpg
 
@@ -210,3 +211,76 @@ async def fetch_account_snapshots_summary(recent_minutes: int = 60) -> List[Dict
             """
             rows = await conn.fetch(fallback_query, recent_minutes)
         return [dict(r) for r in rows]
+
+
+async def get_account_control(account_type: str) -> Dict[str, Any]:
+    """
+    Fetches the manual drawdown-halt override for one account_type.
+    Returns a safe default (not halted) if no row exists yet, so callers
+    never need a None-check before reading ["manual_drawdown_halt"].
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT account_type, manual_drawdown_halt, halt_reason, halted_by, updated_at
+            FROM account_controls
+            WHERE account_type = $1
+            """,
+            account_type,
+        )
+    if not row:
+        return {
+            "account_type": account_type,
+            "manual_drawdown_halt": False,
+            "halt_reason": None,
+            "halted_by": None,
+            "updated_at": None,
+        }
+    return dict(row)
+
+
+async def list_account_controls() -> List[Dict[str, Any]]:
+    """Fetches manual drawdown-halt overrides for every known account_type."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT account_type, manual_drawdown_halt, halt_reason, halted_by, updated_at
+            FROM account_controls
+            """
+        )
+    return [dict(r) for r in rows]
+
+
+async def set_account_control(
+    account_type: str,
+    halt: bool,
+    reason: Optional[str] = None,
+    actor: Optional[str] = "dashboard_operator",
+) -> Dict[str, Any]:
+    """
+    Upserts the manual drawdown-halt flag for an account_type. This is the
+    single write path used by both:
+      - POST /control/drawdown_halt (dashboard Start/Stop button)
+      - any future automated caller (e.g. a future server-side equity guard)
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO account_controls (account_type, manual_drawdown_halt, halt_reason, halted_by, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (account_type) DO UPDATE
+            SET manual_drawdown_halt = EXCLUDED.manual_drawdown_halt,
+                halt_reason = EXCLUDED.halt_reason,
+                halted_by = EXCLUDED.halted_by,
+                updated_at = NOW()
+            RETURNING account_type, manual_drawdown_halt, halt_reason, halted_by, updated_at
+            """,
+            account_type,
+            halt,
+            reason,
+            actor,
+        )
+    return dict(row)

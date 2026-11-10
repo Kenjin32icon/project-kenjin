@@ -33,7 +33,10 @@ import pandas as pd
 load_dotenv()
 
 from db.redis_client import redis_client
-from startup.db import close_db_pool, get_pool, init_db_pool
+from startup.db import (
+    close_db_pool, get_pool, init_db_pool,
+    get_account_control, list_account_controls, set_account_control,
+)
 from startup.schemas import (
     HealthOut, StrategyParamsOut, TelemetryIn, TickIn,
     AccountSnapshotIn, RiskIncidentIn, MissedTradeIn,
@@ -74,6 +77,11 @@ KPI_CACHE_TTL = 10.0  # 10 seconds
 class KillSwitchRequest(BaseModel):
     kill_switch: bool
     reason: Optional[str] = "Manual operator override"
+
+class DrawdownHaltRequest(BaseModel):
+    account_type: str
+    halt: bool
+    reason: Optional[str] = "Manual operator override from admin dashboard"
 
 class StrategyPatchRequest(BaseModel):
     symbol: str
@@ -823,6 +831,10 @@ async def get_kpis():
                 """
             )
 
+            account_controls_rows = await conn.fetch(
+                "SELECT account_type, manual_drawdown_halt, halt_reason, updated_at FROM account_controls"
+            )
+
             recent_incidents = await conn.fetch(
                 """
                 SELECT account_type, asset, reason, details, created_at
@@ -835,6 +847,8 @@ async def get_kpis():
         total_closed = sum(int(r["closed_trades"] or 0) for r in per_asset)
         total_wins = sum(int(r["wins"] or 0) for r in per_asset)
         total_profit = sum(float(r["total_profit"] or 0) for r in per_asset)
+
+        controls_by_account = {r["account_type"]: dict(r) for r in account_controls_rows}
 
         response_data = {
             "summary": {
@@ -911,6 +925,8 @@ async def get_kpis():
                     "drawdown_halt": r["drawdown_halt"],
                     "last_updated": r["ts"].isoformat(),
                     "seconds_since_update": (datetime.now(timezone.utc) - r["ts"]).total_seconds(),
+                    "manual_drawdown_halt": bool(controls_by_account.get(r["account_type"], {}).get("manual_drawdown_halt", False)),
+                    "manual_halt_reason": controls_by_account.get(r["account_type"], {}).get("halt_reason"),
                 }
                 for r in latest_accounts
             ],
@@ -1000,3 +1016,68 @@ async def patch_strategy_params(payload: StrategyPatchRequest):
         "live_approved": payload.live_approved,
         "message": f"Asset {payload.symbol} live execution updated to {payload.live_approved}."
     }
+
+
+@app.post("/control/drawdown_halt", dependencies=[Depends(verify_api_key)], tags=["Control"],
+          summary="Start/Stop manual drawdown halt for an account (gates automated algo-trading)")
+async def set_drawdown_halt(payload: DrawdownHaltRequest):
+    account_type = payload.account_type.strip().lower()
+    if account_type not in ("live", "demo"):
+        raise HTTPException(status_code=400, detail="account_type must be 'live' or 'demo'.")
+
+    result = await set_account_control(
+        account_type=account_type,
+        halt=payload.halt,
+        reason=payload.reason,
+        actor="dashboard_operator",
+    )
+
+    # Log it as a risk incident too, so it shows up in the existing
+    # "Recent Risk Incidents" stream/table alongside automatic trips -
+    # an operator-initiated halt is exactly as important to have a record of.
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO risk_incidents (account_type, asset, reason, details) VALUES ($1,$2,$3,$4)",
+            account_type,
+            None,
+            "manual_drawdown_halt" if payload.halt else "manual_drawdown_halt_cleared",
+            payload.reason,
+        )
+
+    logger.warning(
+        "MANUAL DRAWDOWN HALT %s for account_type=%s | reason=%s",
+        "ENGAGED" if payload.halt else "CLEARED", account_type, payload.reason,
+    )
+
+    await manager.broadcast({
+        "type": "ACCOUNT_CONTROL_UPDATE",
+        "account_type": account_type,
+        "manual_drawdown_halt": payload.halt,
+        "reason": payload.reason,
+        "timestamp": time.time(),
+    })
+
+    # KPI cache holds a stale accounts[] snapshot - invalidate it so the very
+    # next /kpis poll (max 10s away) reflects the new halt state immediately
+    # rather than waiting out the full cache TTL.
+    _KPI_CACHE["data"] = None
+
+    return {
+        "status": "success",
+        "account_type": account_type,
+        "manual_drawdown_halt": result["manual_drawdown_halt"],
+        "message": (
+            f"Automated algo-trading HALTED for {account_type} accounts."
+            if payload.halt else
+            f"Automated algo-trading RESUMED for {account_type} accounts."
+        ),
+    }
+
+
+@app.get("/control/drawdown_halt", dependencies=[Depends(verify_api_key)], tags=["Control"],
+         summary="Get current manual drawdown-halt state (all accounts, or one via ?account_type=)")
+async def get_drawdown_halt(account_type: Optional[str] = None):
+    if account_type:
+        return await get_account_control(account_type.strip().lower())
+    return {"accounts": await list_account_controls()}
